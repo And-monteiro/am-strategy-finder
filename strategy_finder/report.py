@@ -1,4 +1,5 @@
 """Auditable reports, ranked evidence, and deterministic Pine exports."""
+import csv
 import json
 import time
 import urllib.error
@@ -130,6 +131,27 @@ def publish(root, ledger, summarize=True):
         candidates.append(candidate)
     development = counts([r["development"] for r in candidates])
     finals = [r["final"] for r in candidates if r["final"] is not None]
+    probabilities = root / "time-machine-probabilities.csv"
+    fields = ["candidate", "experiment", "timeframe", "indicator", "threshold", "period",
+              "population", "count", "p_target", "p_stop", "p_neither"]
+    temporary = probabilities.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for candidate in candidates:
+            spec = candidate["strategy"]
+            if not spec["time_machine"]:
+                continue
+            for period in ("development", "final"):
+                measured = candidate[period]
+                if measured is None:
+                    continue
+                for population, summary in measured.get("time_machine", {}).items():
+                    writer.writerow({"candidate": candidate["id"], "experiment": candidate["experiment"],
+                                     "timeframe": spec["timeframe"], "indicator": spec["rule"]["indicator"],
+                                     "threshold": spec["time_machine"], "period": period,
+                                     "population": population, **summary})
+    temporary.replace(probabilities)
     final = counts(finals)
     qualified = sorted([r for r in candidates if r["final"] and r["final"]["outcome"] == "qualified"],
                        key=ranking, reverse=True)
@@ -212,7 +234,9 @@ def publish(root, ledger, summarize=True):
                          f'| {rate} | {sharpe} | {out["trades"]} | [{item["pine_status"]}]({item["artifacts"]}/strategy.pine) |')
     if ai:
         lines.extend(["", "## AI commentary", ""] + ["- " + t for t in ai["text"]["findings"] + ai["text"]["limitations"]])
-    lines.extend(["", "Final performance contributes to selection. Forward paper evaluation supplies the next independent evidence.",
+    lines.extend(["", "[Time Machine probabilities by candidate and period](time-machine-probabilities.csv). "
+                  "Values are fractions. Runs made before this metric was added may have no saved probability rows.",
+                  "", "Final performance contributes to selection. Forward paper evaluation supplies the next independent evidence.",
                   "The database preserves results for all tested variants, including unqualified candidates."])
     (root / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return report

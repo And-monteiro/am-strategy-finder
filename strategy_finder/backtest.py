@@ -167,4 +167,19 @@ def metrics(times, result, capital, step):
         "profit_concentration": float(winners.max()/positive) if positive else None,
         "exposure": result["exposure"], "turnover": result["turnover"], "costs": result["costs"],
         "elapsed_days": float((times[-1]-times[0]+step)/DAY),
+        "time_machine": forecast_summary(result["forecasts"]),
+    }
+
+
+def forecast_summary(forecasts):
+    """Summarize simulation probabilities per opportunity, with equal weight."""
+    def summarize(rows):
+        return {"count": len(rows), **{
+            field: float(np.mean([row[field] for row in rows])) if rows else None
+            for field in ("p_target", "p_stop", "p_neither")
+        }}
+
+    return {
+        "scored": summarize(forecasts),
+        "accepted": summarize([row for row in forecasts if row["accepted"]]),
     }
