@@ -81,3 +81,11 @@ before opening holdout data. It tests the leaders frozen at the discovery
 checkpoints and writes `summary.md`, `results.csv`, and `results.json`.
 The tested strategy space and seeded random sampling policy are in the benchmark
 module. Keep the same dates, arms, seeds, budget, and ranking for a comparison.
+
+For the larger Luna comparison, use a fresh prepared directory and pass
+`--model gpt-6-luna --budget 10000 --batch 250 --hours-per-search 2 --max-api-usd 12
+--arms random ai_no_feedback ai_last_five ai_rich` to `discover`. The spending
+guard is shared by all workers in that directory and prices in-flight requests
+conservatively. Keep the same directory, model, seeds, budget, and batch size to
+resume discovery. Pass the same budget, seeds, and arms to `evaluate`. The large
+benchmark freezes picks at 300, 1,000, 3,000, and 10,000 unique evaluations.

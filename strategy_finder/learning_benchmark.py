@@ -4,12 +4,15 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import random
+import sqlite3
 import threading
 import time
 import urllib.error
 from statistics import mean, median
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import closing
 from pathlib import Path
 
 from . import planner
@@ -28,6 +31,58 @@ OUTPUT_LOCK = threading.Lock()
 def log(*parts):
     with OUTPUT_LOCK:
         print(*parts, flush=True)
+
+
+class BudgetExhausted(ValueError):
+    pass
+
+
+class APIUnavailable(ValueError):
+    pass
+
+
+def api_error_code(error):
+    try:
+        return json.loads(error.read(65536)).get("error", {}).get("code")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def budgeted_response(database, ceiling, model, instructions, payload, schema, deadline):
+    receipt = None
+    if database is not None:
+        # Microdollars at Luna rates, with conservative input cache-write pricing.
+        size = len(encode([instructions, payload, schema]).encode("utf-8")) + 4096
+        reserved = (size + 7)//8 + 2250
+        with closing(sqlite3.connect(database, timeout=30)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            blocked = db.execute("SELECT reason FROM api_block").fetchone()
+            if blocked:
+                raise APIUnavailable(blocked[0])
+            spent = db.execute("SELECT coalesce(sum(microdollars),0) FROM requests").fetchone()[0]
+            if spent + reserved > ceiling:
+                raise BudgetExhausted("Shared Luna API spending guard reached.")
+            receipt = db.execute("INSERT INTO requests(microdollars) VALUES (?)", (reserved,)).lastrowid
+    try:
+        proposal, response = planner.response(model, instructions, payload, schema, deadline, "learning_experiment")
+    except urllib.error.HTTPError as exc:
+        code = api_error_code(exc)
+        if code in ("credit_balance_exhausted", "insufficient_quota") or exc.code in (401, 403, 404):
+            reason = f"OpenAI API unavailable (HTTP {exc.code}, {code or 'access denied'})."
+            if receipt is not None:
+                with closing(sqlite3.connect(database, timeout=30)) as db, db:
+                    db.execute("DELETE FROM requests WHERE id=?", (receipt,))
+                    db.execute("INSERT OR REPLACE INTO api_block(id,reason) VALUES (1,?)", (reason,))
+            raise APIUnavailable(reason) from None
+        if exc.code == 429:
+            time.sleep(min(5, max(0, deadline - time.time())))
+        raise
+    usage = response.get("usage") or {}
+    if receipt is not None and "input_tokens" in usage and "output_tokens" in usage:
+        upper = (usage["input_tokens"] + 7)//8 + (usage["output_tokens"] + 1)//2
+        with closing(sqlite3.connect(database, timeout=30)) as db, db:
+            db.execute("UPDATE requests SET microdollars=? WHERE id=?", (upper, receipt))
+    return proposal, response
 
 
 def prepare(root, assets, start, end, frames):
@@ -81,46 +136,61 @@ def _state(candidates, experiments, checkpoints, attempts, usage, errors, duplic
             "attempts": attempts, "usage": usage, "errors": errors, "duplicates": duplicates}
 
 
-def search(path, arm, seed, data, config, model, goals, budget, inherited=None):
+def search(path, arm, seed, data, config, model, goals, budget, inherited=None,
+           batch=50, hours=.5, ceiling=None, spending_db=None):
     """Search only development arrays. This function never opens holdout files."""
+    saved = None
     if path.exists():
         saved = json.loads(path.read_text(encoding="utf-8"))
+        if (saved["model"] != model or saved.get("budget", budget) != budget
+                or saved.get("batch", batch) != batch):
+            raise ValueError(f"Saved benchmark settings differ at {path}.")
         if saved["status"] == "complete":
             return saved
-    state = inherited or _state([], [], {}, 0, [], [], 0)
+    origin = inherited or _state([], [], {}, 0, [], [], 0)
+    state = saved or origin
     candidates = list(state["candidates"])
     experiments = list(state["experiments"])
     checkpoints = dict(state["checkpoints"])
-    inherited_count = len(candidates)
+    inherited_count = len(origin["candidates"])
     used = {encode(c["strategy"]) for c in candidates}
-    attempts = duplicates = 0
-    usage, errors = [], []
+    attempts = saved["attempts"] if saved else 0
+    duplicates = saved["duplicates"] if saved else 0
+    usage = list(saved["usage"]) if saved else []
+    errors = list(saved["errors"]) if saved else []
     rng = random.Random(seed)
+    if saved and "random_state" in saved:
+        version, values, spare = saved["random_state"]
+        rng.setstate((version, tuple(values), spare))
     execution = Execution(**config["execution"])
     feature = {frame: {} for frame in data}
     replay = {frame: {} for frame in data}
     start = time.monotonic()
     base = {"assets": config["assets"], "allowed_timeframes": list(data)}
     leader = max(candidates, key=lambda c: development_score(c["development"]), default=None)
-    deadline = time.time() + 1800
+    deadline = time.time() + hours*3600
+    max_attempts = max(42, 12 * (budget // batch + 1))
+    last_saved = len(candidates)
 
     def save(status):
         result = _state(candidates, experiments, checkpoints, attempts, usage, errors, duplicates)
         result.update({"arm": arm, "seed": seed, "model": model, "status": status,
-                       "seconds": time.monotonic()-start, "inherited_count": inherited_count})
+                       "seconds": time.monotonic()-start + (saved["seconds"] if saved else 0),
+                       "inherited_count": inherited_count, "budget": budget, "batch": batch,
+                       "random_state": rng.getstate()})
         write_json(path, result)
         return result
 
-    while len(candidates) < budget and attempts < 42 and time.time() < deadline:
+    while len(candidates) < budget and attempts < max_attempts and time.time() < deadline:
         attempts += 1
-        local_experiments = experiments if arm != "memory_reset" else experiments[len(state["experiments"]):]
+        local_experiments = experiments if arm != "memory_reset" else experiments[len(origin["experiments"]):]
         local_candidates = candidates if arm != "memory_reset" else candidates[inherited_count:]
         n = len(experiments) + 1
         try:
             if arm == "random":
                 proposal = random_proposal(rng, list(data))
             else:
-                payload = {**base, "proposal_number": n, "max_variants": 50}
+                payload = {**base, "proposal_number": n, "max_variants": batch}
                 instructions, schema = planner.INSTRUCTIONS, planner.SCHEMA
                 if arm == "ai_last_five":
                     payload.update(recent_development_results=experiments[-5:], prior_development_memory=[])
@@ -129,15 +199,18 @@ def search(path, arm, seed, data, config, model, goals, budget, inherited=None):
                     action = requested_action(attempts-1, bool(local_experiments))
                     payload.update(development_feedback=context, requested_action=action)
                     instructions, schema = RICH_INSTRUCTIONS, RICH_SCHEMA
-                proposal, response = planner.response(model, instructions, payload, schema, deadline,
-                                                       "learning_experiment")
+                if batch > 50:
+                    instructions += ("\nPropose a grid with at least max_variants valid combinations. "
+                                     "Vary several meaningful numeric settings while retaining the hypothesis.")
+                proposal, response = budgeted_response(spending_db, ceiling, model, instructions,
+                                                       payload, schema, deadline)
                 usage.append(response)
                 if arm in ("ai_rich", "memory_reset", "memory_retained"):
                     validate_action(proposal, context, action)
-            choices = variants(proposal, 50, rng.randrange(2**32), list(data))
+            choices = variants(proposal, batch, rng.randrange(2**32), list(data))
         except (ValueError, KeyError, TypeError, TimeoutError, urllib.error.URLError) as exc:
             errors.append(str(exc))
-            if isinstance(exc, urllib.error.HTTPError) and exc.code in (401, 403, 404):
+            if isinstance(exc, (BudgetExhausted, APIUnavailable)):
                 break
             continue
 
@@ -166,12 +239,33 @@ def search(path, arm, seed, data, config, model, goals, budget, inherited=None):
             if len(candidates) == budget:
                 break
         experiments.append(experiment_summary(n, proposal, evaluated, len(choices)))
-        save("running")
+        if len(candidates) - last_saved >= min(500, max(50, batch)) or len(candidates) in goals:
+            save("running")
+            last_saved = len(candidates)
         log(path.parent.name, path.stem, len(candidates), "/", budget, "attempts", attempts)
     return save("complete" if len(candidates) == budget else "incomplete")
 
 
-def discover(root, model, seeds, workers, arms, budget):
+def run_job(setup, seed, arm, config, data, model, goals, budget, fork, options):
+    directory = setup / f"seed-{seed}"
+    directory.mkdir(exist_ok=True)
+    if arm == "shared-checkpoint":
+        result = search(directory / "shared-checkpoint.json", "ai_rich", seed,
+                        data, config, model, goals, budget//2, **options)
+    else:
+        base = None
+        effective_arm = arm
+        if fork and arm in ("ai_rich", "memory_reset"):
+            base = json.loads((directory / "shared-checkpoint.json").read_text(encoding="utf-8"))
+            if base["status"] != "complete":
+                raise ValueError("Shared checkpoint did not finish.")
+            effective_arm = "memory_retained" if arm == "ai_rich" else arm
+        result = search(directory / f"{arm}.json", effective_arm, seed, data,
+                        config, model, goals, budget, base, **options)
+    return {key: result[key] for key in ("status", "arm", "seed", "errors")}
+
+
+def discover(root, model, seeds, workers, arms, budget, batch=50, hours=.5, max_usd=None):
     jobs = []
     configs = {}
     for setup in sorted(root.iterdir()):
@@ -179,48 +273,54 @@ def discover(root, model, seeds, workers, arms, budget):
             config = json.loads((setup / "config.json").read_text(encoding="utf-8"))
             configs[setup] = (config, load_data(setup, config))
             jobs.extend((setup, seed, arm) for seed in seeds for arm in arms)
-    goals = sorted({min(50, budget), budget//2, budget})
+    fork = "memory_reset" in arms
+    checkpoints = [min(50, budget), budget//2] if budget < 1000 else [300, 1000, 3000]
+    goals = sorted({budget, *(n for n in checkpoints if n < budget),
+                    *([budget//2] if fork else [])})
     if not jobs:
         raise ValueError("No benchmark datasets were prepared.")
 
-    def job(setup, seed, arm):
+    if any(arm != "random" for arm in arms) and not os.getenv("OPENAI_API_KEY"):
+        raise ValueError("Configure OPENAI_API_KEY before starting AI discovery.")
+    if max_usd is not None and (model != "gpt-6-luna" or max_usd <= 0):
+        raise ValueError("The spending guard requires a positive limit and the gpt-6-luna model.")
+    options = {"batch": batch, "hours": hours,
+               "ceiling": round(max_usd*1_000_000) if max_usd is not None else None,
+               "spending_db": root / "api-spending.sqlite" if max_usd is not None else None}
+    if options["spending_db"] is not None:
+        with closing(sqlite3.connect(options["spending_db"], timeout=30)) as db, db:
+            db.execute("CREATE TABLE IF NOT EXISTS requests (id INTEGER PRIMARY KEY, microdollars INTEGER)")
+            db.execute("CREATE TABLE IF NOT EXISTS api_block (id INTEGER PRIMARY KEY, reason TEXT NOT NULL)")
+            db.execute("DELETE FROM api_block")
+
+    def submit(pool, setup, seed, arm):
         config, data = configs[setup]
-        directory = setup / f"seed-{seed}"
-        directory.mkdir(exist_ok=True)
-        if arm in ("ai_rich", "memory_reset"):
-            base = search(directory / "shared-checkpoint.json", "ai_rich", seed, data, config,
-                          model, goals, budget//2)
-            if base["status"] != "complete":
-                raise ValueError("Shared checkpoint did not finish.")
-            effective_arm = "memory_retained" if arm == "ai_rich" else arm
-            return search(directory / f"{arm}.json", effective_arm, seed, data, config,
-                          model, goals, budget, base)
-        return search(directory / f"{arm}.json", arm, seed, data, config, model, goals, budget)
+        return pool.submit(run_job, setup, seed, arm, config, data, model,
+                           goals, budget, fork, options)
 
     # Build shared checkpoints before launching either continuation.
-    with ThreadPoolExecutor(workers) as pool:
-        if set(arms) & {"ai_rich", "memory_reset"}:
-            def checkpoint(setup, seed):
-                config, data = configs[setup]
-                directory = setup / f"seed-{seed}"
-                directory.mkdir(exist_ok=True)
-                return search(directory / "shared-checkpoint.json", "ai_rich", seed,
-                              data, config, model, goals, budget//2)
-            shared = [pool.submit(checkpoint, setup, seed) for setup in configs for seed in seeds]
+    complete = True
+    with ProcessPoolExecutor(workers) as pool:
+        if fork:
+            shared = [submit(pool, setup, seed, "shared-checkpoint") for setup in configs for seed in seeds]
         else:
             shared = []
-        standard = [pool.submit(job, *args) for args in jobs if args[2] not in ("ai_rich", "memory_reset")]
+        standard = [submit(pool, *args) for args in jobs if not fork or args[2] not in ("ai_rich", "memory_reset")]
         for future in as_completed(shared):
             if future.result()["status"] != "complete":
+                complete = False
                 log("A shared checkpoint is incomplete.")
-        continuations = [pool.submit(job, *args) for args in jobs if args[2] in ("ai_rich", "memory_reset")]
+        continuations = [submit(pool, *args) for args in jobs if fork and args[2] in ("ai_rich", "memory_reset")]
         for future in as_completed(standard + continuations):
             try:
                 result = future.result()
                 if result["status"] != "complete":
+                    complete = False
                     log("INCOMPLETE", result["arm"], result["seed"], result["errors"][-3:])
             except ValueError as exc:
+                complete = False
                 log("INCOMPLETE", str(exc))
+    return complete
 
 
 def evaluate(root, seeds, arms, budget):
@@ -333,6 +433,9 @@ def main():
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--arms", nargs="+", choices=ARMS, default=list(ARMS))
     parser.add_argument("--budget", type=int, default=300)
+    parser.add_argument("--batch", type=int, default=50)
+    parser.add_argument("--hours-per-search", type=float, default=.5)
+    parser.add_argument("--max-api-usd", type=float)
     parser.add_argument("--assets", nargs="+")
     parser.add_argument("--start")
     parser.add_argument("--end")
@@ -340,16 +443,20 @@ def main():
     args = parser.parse_args()
     if args.budget < 4 or args.budget % 2:
         parser.error("Budget must be an even number at least four.")
+    if not 1 <= args.batch <= 1000 or args.hours_per_search <= 0:
+        parser.error("Batch must be 1–1000 and hours per search must be positive.")
     if args.phase == "prepare":
         if not all((args.assets, args.start, args.end)):
             parser.error("Prepare requires --assets, --start, and --end.")
         prepare(args.root, args.assets, args.start, args.end, args.timeframes)
     elif args.phase == "discover":
         load_openai_settings(Path(".env"))
-        discover(args.root, args.model, args.seeds, args.workers, args.arms, args.budget)
+        complete = discover(args.root, args.model, args.seeds, args.workers, args.arms, args.budget,
+                            args.batch, args.hours_per_search, args.max_api_usd)
+        return 0 if complete else 1
     else:
         evaluate(args.root, args.seeds, args.arms, args.budget)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
