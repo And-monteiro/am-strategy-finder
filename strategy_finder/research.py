@@ -27,7 +27,15 @@ def encode(value):
 def write_json(path, data):
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    # Windows readers and sync clients can briefly hold the destination open.
+    for attempt in range(6):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError:
+            if attempt == 5:
+                raise
+            time.sleep(.1 * (attempt + 1))
 
 
 class Ledger:

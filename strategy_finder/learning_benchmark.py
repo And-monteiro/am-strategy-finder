@@ -322,7 +322,7 @@ def discover(root, model, seeds, workers, arms, budget, batch=50, hours=.5, max_
                 if result["status"] != "complete":
                     complete = False
                     log("INCOMPLETE", result["arm"], result["seed"], result["errors"][-3:])
-            except ValueError as exc:
+            except (ValueError, OSError) as exc:
                 complete = False
                 log("INCOMPLETE", str(exc))
     return complete
