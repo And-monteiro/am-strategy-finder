@@ -16,6 +16,7 @@ import numpy as np
 from . import planner
 from .backtest import EvaluationDeadline, Execution, daily_returns, metrics, simulate
 from .data import DAY, STEPS, load_snapshot, partition_hash
+from .feedback import RICH_INSTRUCTIONS, RICH_SCHEMA, requested_action, rich_context, validate_action
 from .strategy import Rule, Strategy, signals
 
 
@@ -224,7 +225,8 @@ def run(root, ledger, memory):
     tm_cache = {frame: {} for frame in frames}
     final_ids = ledger.get("final_ids")
     reserved = sum(max(.05, result["seconds"]) * 1.5
-                   for row in ledger.db.execute("SELECT development FROM candidates WHERE development IS NOT NULL")
+                   for row in ledger.db.execute("SELECT development FROM candidates "
+                                                "WHERE development IS NOT NULL AND final IS NULL")
                    if (result := json.loads(row["development"]))["outcome"] == "qualified")
     if final_ids is None:
         while time.time() < deadline - max(config["duration"]*.12, reserved):
@@ -233,17 +235,22 @@ def run(root, ledger, memory):
                 count = ledger.db.execute("SELECT count(*) FROM experiments").fetchone()[0]
                 if config["experiments"] and count >= config["experiments"]:
                     break
-                recent = experiment_report(ledger, limit=5)
                 try:
                     if config["offline"]:
                         proposal, provider = planner.offline(count, frames), {"model": "offline"}
                     else:
+                        recent = experiment_report(ledger, limit=10)
+                        history = development_history(ledger)
+                        context = rich_context(recent, history)
+                        action = requested_action(count, bool(history))
                         proposal, provider = planner.response(
-                            config["model"], planner.INSTRUCTIONS,
+                            config["model"], RICH_INSTRUCTIONS,
                             {"assets": config["assets"], "allowed_timeframes": frames,
-                             "recent_development_results": recent, "prior_development_memory": memory},
-                            planner.SCHEMA, min(deadline - max(config["duration"]*.12, reserved), time.time()+90),
+                             "development_feedback": context, "requested_action": action,
+                             "prior_development_memory": memory},
+                            RICH_SCHEMA, min(deadline - max(config["duration"]*.12, reserved), time.time()+90),
                             "strategy_experiment")
+                        validate_action(proposal, context, action)
                     choices = variants(proposal, config["variants"], config["seed"]+count, frames,
                                        rotation=len(config["assets"]) == 2)
                 except (TimeoutError, ValueError, TypeError, KeyError, urllib.error.URLError) as exc:
@@ -333,3 +340,11 @@ def experiment_report(ledger, limit=-1):
                        "generated": len(json.loads(exp["variants"])), "unique": len(records),
                        "funnel": counts([t["metrics"] for t in tested]), "top_parameters": tested[:3]})
     return report
+
+
+def development_history(ledger):
+    return [{"experiment": row["experiment"], "strategy": json.loads(row["strategy"]),
+             "development": json.loads(row["development"])}
+            for row in ledger.db.execute(
+                "SELECT experiment,strategy,development FROM candidates "
+                "WHERE development IS NOT NULL ORDER BY experiment,rowid")]

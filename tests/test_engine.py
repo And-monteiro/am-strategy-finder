@@ -7,12 +7,34 @@ import numpy as np
 
 from strategy_finder.backtest import Execution, metrics, simulate, time_machine
 from strategy_finder.data import DAY, HOUR, Candle, align, load_snapshot, save_snapshot
+from strategy_finder.feedback import rich_context, validate_action
 from strategy_finder.research import assess, variants
 from strategy_finder.planner import offline
 from strategy_finder.strategy import Rule, Strategy, pine, signals
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_rich_feedback_keeps_older_winner_and_excludes_holdout(self):
+        good = Strategy("1d", Rule("return", 3, .1, 0, "above")).to_dict()
+        bad = Strategy("1d", Rule("zscore", 5, .5, 0, "above")).to_dict()
+        def candidate(spec, n, ret, outcome):
+            return {"strategy": spec, "experiment": n, "final": {"secret": True},
+                    "development": {"net_return": ret, "outcome": outcome, "trades": 10,
+                                    "max_drawdown": .1, "sharpe": ret, "periods": [],
+                                    "funnel": {"profitable_after_costs": ret > 0}}}
+        latest = [{"experiment": n, "funnel": {}, "top_parameters": [],
+                   "proposal": {"hypothesis": "", "timeframe": "1d", "indicator": "return"}}
+                  for n in range(2, 15)]
+        context = rich_context(latest, [candidate(good, 1, .5, "qualified"),
+                                        candidate(bad, 2, -.5, "rejected")])
+        self.assertEqual(len(context["last_experiments"]), 10)
+        self.assertEqual(context["strong_candidates"][0]["experiment"], 1)
+        self.assertEqual(context["weak_candidates"][0]["experiment"], 2)
+        self.assertNotIn("secret", str(context))
+        validate_action({"action": "refinement", "parent": 1}, context, None)
+        with self.assertRaises(ValueError):
+            validate_action({"action": "refinement", "parent": 1}, context, "new_hypothesis")
+
     def test_bracket_ignores_opposing_signal_until_take_profit(self):
         times = np.arange(5)*HOUR
         bars = np.array([[[100, 101, 99, 100, 1]],

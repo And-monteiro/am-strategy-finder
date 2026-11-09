@@ -10,7 +10,8 @@ import numpy as np
 from . import planner
 from .backtest import Execution, metrics, simulate
 from .data import STEPS
-from .research import STAGES, counts, experiment_report, load_data, write_json
+from .feedback import rich_context
+from .research import STAGES, counts, development_history, experiment_report, load_data, write_json
 from .strategy import Strategy, pine, signals
 
 
@@ -196,7 +197,8 @@ def publish(root, ledger, summarize=True):
     # This memory has no holdout summaries. Only import it into later runs
     # whose own development cutoff covers all of the remembered observations.
     write_json(root / "development-memory.json", {"assets": config["assets"],
-        "last_development_timestamp": config["split"], "experiments": experiments[-5:]})
+        "last_development_timestamp": config["split"],
+        "feedback": rich_context(experiments, development_history(ledger))})
     ai = ledger.get("ai_summary")
     if ai and ai["tested_final"] != len(finals):
         ai = None

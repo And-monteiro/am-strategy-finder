@@ -175,6 +175,8 @@ def parser():
     resume = actions.add_parser("resume")
     resume.add_argument("run", type=Path)
     resume.add_argument("--extend", type=duration)
+    resume.add_argument("--continue-discovery", action="store_true",
+                        help="Search for new candidates from the existing development ledger.")
     report = actions.add_parser("report")
     report.add_argument("run", type=Path)
     return cli
@@ -204,9 +206,18 @@ def main():
                 if not config:
                     raise ValueError("Data preparation did not finish. Start again; cached archives will be reused.")
                 if args.action == "resume":
+                    if args.continue_discovery and not args.extend:
+                        raise ValueError("--continue-discovery requires --extend.")
                     if args.extend:
-                        config["deadline"] = max(time.time(), config["deadline"]) + args.extend
+                        if args.continue_discovery:
+                            config["deadline"] = time.time() + args.extend
+                            config["duration"] = args.extend
+                            config["experiments"] = 0
+                        else:
+                            config["deadline"] = max(time.time(), config["deadline"]) + args.extend
                         ledger.set("config", config)
+                    if args.continue_discovery:
+                        ledger.set("final_ids", None)
                     run(root, ledger, memory_from(root.parent, root, config))
                 publish(root, ledger, summarize=args.action != "report")
         print(f"Report: {root / 'report.md'}")

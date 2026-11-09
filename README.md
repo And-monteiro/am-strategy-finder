@@ -19,6 +19,7 @@ strategy-finder investigate --asset BTC --pair ETH --duration 8h
 strategy-finder investigate --asset BTC --offline --experiments 1 --variants 12 --timeframes 4h --duration 5m
 strategy-finder report runs/<run-id>
 strategy-finder resume runs/<run-id> --extend 30m
+strategy-finder resume runs/<run-id> --continue-discovery --extend 30m
 ```
 
 Docker Compose runs the same CLI. Supply the variables in the calling environment. The default mounts persist data and reports.
@@ -30,6 +31,13 @@ docker compose run --build --rm finder investigate --asset BTC --duration 8h
 By default the CLI requests the previous five years of 1h Binance spot candles, checks bulk archive checksums and fills the recent tail with the public API. It uses direct EUR markets (`BTC/EUR`, `ETH/EUR`) so initial cash, fills and equity share the same denomination. Arbitrary quote currencies and automatic FX conversion are outside this version. Listing dates and missing archives can shorten coverage. Each dataset records actual bars, missing intervals, and partition hashes. Local hourly EUR CSVs can be supplied with `--csv` once per asset, in asset order. The header is `timestamp,open,high,low,close,volume`, with UTC epoch **seconds** for candle opens. Supply `--start YYYY-MM-DD --end YYYY-MM-DD` to select a UTC range with an exclusive end date.
 
 ## Research policy
+
+The AI receives development-only feedback from the last ten experiments, the
+strongest and weakest distinct candidates, and progress by strategy family.
+An explicit continuation reuses the same dataset, candidate ledger, and
+development feedback. Previously evaluated holdout results remain in the
+evaluator and are reused for reporting. Continue with fresh data for an independent
+test if decisions about what to search have already been influenced by the holdout.
 
 The AI can propose signal exits, bracket exits, or both within an experiment.
 Signal exits can close or rotate a holding when the opposing condition fires.
@@ -53,3 +61,23 @@ A run contains `report.md`, `report.json`, a SQLite ledger, and hashed candle sn
 The TradingView shortlist includes qualifying single-asset strategies without the Time Machine gate. Use the generated Pine v6 file on the matching Binance EUR chart and timeframe. Matching data and execution settings are necessary for comparison. Percentage slippage and some stop/target semantics have no exact translation in the standard emulator, so affected scripts are labelled approximate. Rotation and Time Machine emit Pine diagnostics for the underlying rule, with their full evaluation retained in Python.
 
 Run the regression checks with `python -m unittest discover -s tests -v`.
+
+## Learning benchmark
+
+Run these phases in order. Discovery compares seeded random proposals, AI
+without feedback, AI with the last five experiments, and AI with richer
+development feedback. The richer search also forks at half the trial budget
+to compare retained and reset memory from the same candidate ledger.
+
+```text
+python -m strategy_finder.learning_benchmark prepare runs/learning-test --assets ETH SOL --start 2021-11-01 --end 2026-10-01 --timeframes 1d
+python -m strategy_finder.learning_benchmark discover runs/learning-test --model gpt-6.1-sol
+python -m strategy_finder.learning_benchmark evaluate runs/learning-test
+```
+
+Discovery reads development snapshots only and uses the local OpenAI settings.
+Evaluation checks that every requested arm finished its unique-candidate budget
+before opening holdout data. It tests the leaders frozen at the discovery
+checkpoints and writes `summary.md`, `results.csv`, and `results.json`.
+The tested strategy space and seeded random sampling policy are in the benchmark
+module. Keep the same dates, arms, seeds, budget, and ranking for a comparison.
