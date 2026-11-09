@@ -4,6 +4,12 @@ A local research CLI for long-only spot crypto and two-asset rotation. The engin
 
 ## Start
 
+On Windows, double-click `Start Strategy Finder.bat` after installing the project
+into `.venv`. Press Enter to keep a prompt's default or type a replacement.
+The launcher loads `OPENAI_API_KEY` and `OPENAI_MODEL` from the ignored `.env`
+file beside it. Choose **quick** for one small AI experiment, **full** for
+the eight-hour investigation, or **offline** for a trial without an API key.
+
 Python 3.11+ and an OpenAI API key are needed for AI investigations. Set `OPENAI_API_KEY` and `OPENAI_MODEL` to a model available to your API project that supports Responses API Structured Outputs. The offline planner is useful for testing the workflow without credentials.
 
 ```text
