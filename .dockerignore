@@ -1,0 +1,10 @@
+.git
+.env*
+.venv
+.test-deps
+runs
+cache
+__pycache__
+*.sqlite*
+*.csv
+*.parquet

@@ -1,0 +1,9 @@
+services:
+  finder:
+    build: .
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+    volumes:
+      - ./runs:/app/runs
+      - ./cache:/app/cache
