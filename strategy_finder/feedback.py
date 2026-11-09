@@ -15,6 +15,42 @@ If a family has plateaued, simplify it or explore another idea. A new hypothesis
 must have a null parent and must change the indicator or rule structure rather
 than just nudge a threshold. Never request final-period results.
 """
+MATCHED_SCHEMA = planner.obj({**RICH_SCHEMA["properties"],
+    "matched_change": {"type": "string", "enum": ["exit_policy", "time_machine"]},
+})
+MATCHED_INSTRUCTIONS = RICH_INSTRUCTIONS + """
+Choose one matched_change. Each sampled parameter set produces one control and
+one treatment. The local engine samples the grid and does all the backtests.
+For exit_policy, provide one opposing exit threshold, positive stops and targets,
+and compare signal exits with bracket exits. Time Machine is off for both sides.
+For time_machine, choose exactly one exit policy, one positive probability
+threshold, positive stops and targets, and holding limits of 1–48 bars. Give
+only the positive threshold for this matched proposal. The engine supplies the
+zero-threshold control automatically.
+Use the campaign experiment map to avoid repeating exhausted hypotheses and
+use the paired effects to decide which change to investigate next. Return
+grids appropriate to the local budget, including smaller grids when warranted.
+"""
+
+
+def campaign_map(experiments):
+    """One compact development-only record per experiment, including older work."""
+    records = []
+    for exp in experiments:
+        proposal = exp["proposal"]
+        paired = exp.get("matched")
+        entry = {"experiment": exp["experiment"], "parent": proposal.get("parent"),
+                 "hypothesis": proposal["hypothesis"][:220],
+                 "timeframe": proposal["timeframe"], "indicator": proposal["indicator"],
+                 "tested": exp["funnel"]["tested"],
+                 "qualified": exp["funnel"]["consistent_across_periods"]}
+        if paired:
+            entry.update(change=paired["change"], pairs=paired["completed_pairs"],
+                         median_net_return_delta=paired["median_net_return_delta"],
+                         median_drawdown_delta=paired["median_drawdown_delta"],
+                         treatment_wins=paired["treatment_wins"])
+        records.append(entry)
+    return records
 
 
 def development_score(metrics):
@@ -94,6 +130,7 @@ def validate_action(proposal, context, action):
     if selected not in ACTIONS or (action and selected != action):
         raise ValueError("Proposal did not use the requested search action.")
     visible = {exp["experiment"] for exp in context["last_experiments"]}
+    visible.update(exp["experiment"] for exp in context.get("campaign_experiments", []))
     visible.update(c["experiment"] for c in context["strong_candidates"] + context["weak_candidates"])
     if selected == "new_hypothesis":
         if parent is not None:

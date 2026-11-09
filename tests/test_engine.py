@@ -8,12 +8,29 @@ import numpy as np
 from strategy_finder.backtest import Execution, metrics, simulate, time_machine
 from strategy_finder.data import DAY, HOUR, Candle, align, load_snapshot, save_snapshot
 from strategy_finder.feedback import rich_context, validate_action
-from strategy_finder.research import assess, variants
-from strategy_finder.planner import offline
+from strategy_finder.research import assess, matched_variants, variants
+from strategy_finder.planner import matched_offline, offline
 from strategy_finder.strategy import Rule, Strategy, pine, signals
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_matched_pairs_keep_shared_settings_and_unique_candidates(self):
+        proposal = matched_offline(0, ["1d"])
+        exit_pairs = matched_variants(proposal, 12, 19, ["1d"])
+        self.assertEqual(len(exit_pairs), 12)
+        for a, b in zip(exit_pairs[::2], exit_pairs[1::2]):
+            control, treatment = Strategy.from_dict(a), Strategy.from_dict(b)
+            self.assertEqual(treatment, replace(control, exit_policy="bracket",
+                                                rule=replace(control.rule, exit=None)))
+        tm_proposal = dict(proposal, matched_change="time_machine", exit_policies=["bracket"],
+                           exits=[], time_machine_thresholds=[.2])
+        tm_pairs = matched_variants(tm_proposal, 12, 19, ["1d"])
+        self.assertEqual(len(tm_pairs), 12)
+        for a, b in zip(tm_pairs[::2], tm_pairs[1::2]):
+            self.assertEqual(Strategy.from_dict(b), replace(Strategy.from_dict(a), time_machine=.2))
+        with self.assertRaises(ValueError):
+            matched_variants(proposal, 11, 19, ["1d"])
+
     def test_fixed_allocation_does_not_change_with_stop_distance(self):
         times = np.arange(3)*HOUR
         bars = np.full((3, 1, 5), 100.)

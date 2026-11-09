@@ -97,3 +97,21 @@ def offline(index, frames):
             "entries": entries, "exits": exits, "holding_periods": [0, 12],
             "stops": [0, .03], "targets": [0, .06], "time_machine_thresholds": [0, .35],
             "filter_rule": None}
+
+
+def matched_offline(index, frames):
+    frame = frames[index % len(frames)]
+    return {
+        "hypothesis": "For momentum entries, compare signal exits with bracket exits.",
+        "parent": None, "action": "new_hypothesis",
+        "expected_change": "Measure the effect of removing the opposing sell signal.",
+        "matched_change": "exit_policy", "timeframe": frame,
+        "indicator": "return", "direction": "above",
+        "lookbacks": list(range(10 + index, 121 + index, 5)),
+        "entries": [x/100 for x in range(1, 16)],
+        "exits": [-.01], "holding_periods": [0, 5, 10, 15, 20, 30, 45],
+        "stops": [x/100 for x in range(2, 16)],
+        "targets": [x/100 for x in range(4, 37, 2)],
+        "exit_policies": ["signal", "bracket"], "time_machine_thresholds": [0],
+        "filter_rule": None,
+    }

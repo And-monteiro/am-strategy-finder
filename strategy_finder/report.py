@@ -10,7 +10,7 @@ import numpy as np
 from . import planner
 from .backtest import Execution, metrics, simulate
 from .data import STEPS
-from .feedback import rich_context
+from .feedback import campaign_map, rich_context
 from .research import STAGES, counts, development_history, experiment_report, load_data, write_json
 from .strategy import Strategy, pine, signals
 
@@ -196,9 +196,16 @@ def publish(root, ledger, summarize=True):
                             for row in ledger.db.execute("SELECT phase,details FROM events ORDER BY id")]}
     # This memory has no holdout summaries. Only import it into later runs
     # whose own development cutoff covers all of the remembered observations.
+    feedback = rich_context(experiments, development_history(ledger))
+    if config.get("matched"):
+        feedback["campaign_experiments"] = campaign_map(experiments)
+        feedback["latest_matched_experiment"] = (
+            {"proposal": experiments[-1]["proposal"], "effects": experiments[-1].get("matched")}
+            if experiments else None
+        )
     write_json(root / "development-memory.json", {"assets": config["assets"],
         "last_development_timestamp": config["split"],
-        "feedback": rich_context(experiments, development_history(ledger))})
+        "feedback": feedback})
     ai = ledger.get("ai_summary")
     if ai and ai["tested_final"] != len(finals):
         ai = None
@@ -229,6 +236,17 @@ def publish(root, ledger, summarize=True):
     for exp in experiments:
         numbers = " | ".join(str(exp["funnel"][key]) for key in STAGES)
         lines.append(f'| {exp["experiment"]} | {exp["proposal"]["timeframe"]} | {exp["proposal"]["indicator"]} | {exp["generated"]} | {exp["unique"]} | {numbers} |')
+    comparisons = [e for e in experiments if "matched" in e]
+    if comparisons:
+        lines.extend(["", "## Matched development comparisons", "",
+                      "| Experiment | Rule changed | Complete pairs | Treatment wins / ties / losses | Median net-return change |",
+                      "|---|---|---:|---:|---:|"])
+        for exp in comparisons:
+            m = exp["matched"]
+            delta = m["median_net_return_delta"]
+            shown = "—" if delta is None else f"{delta*100:+.2f} pp"
+            lines.append(f'| {exp["experiment"]} | {m["change"]} | {m["completed_pairs"]}/{m["planned_pairs"]} '
+                         f'| {m["treatment_wins"]} / {m["ties"]} / {m["treatment_losses"]} | {shown} |')
     for name, leaders in (("Overall shortlist", overall), ("TradingView Strategy Tester shortlist", tradingview)):
         lines.extend(["", f"## {name}", ""])
         if not leaders:

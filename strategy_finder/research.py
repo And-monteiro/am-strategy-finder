@@ -16,7 +16,8 @@ import numpy as np
 from . import planner
 from .backtest import EvaluationDeadline, Execution, daily_returns, metrics, simulate
 from .data import DAY, STEPS, load_snapshot, partition_hash
-from .feedback import RICH_INSTRUCTIONS, RICH_SCHEMA, requested_action, rich_context, validate_action
+from .feedback import (MATCHED_INSTRUCTIONS, MATCHED_SCHEMA, RICH_INSTRUCTIONS, RICH_SCHEMA,
+                       campaign_map, requested_action, rich_context, validate_action)
 from .strategy import Rule, Strategy, signals
 
 
@@ -130,6 +131,39 @@ def variants(proposal, count, seed, frames, rotation=False):
     return list(candidates.values())
 
 
+def matched_variants(proposal, count, seed, frames, rotation=False):
+    """Emit alternating control and treatment, with one declared rule change."""
+    if count < 2 or count % 2:
+        raise ValueError("Matched experiments need a positive even backtest budget.")
+    change = proposal.get("matched_change")
+    if change not in ("exit_policy", "time_machine"):
+        raise ValueError("Matched change must be exit_policy or time_machine.")
+    base = dict(proposal, time_machine_thresholds=[0])
+    for field in ("stops", "targets"):
+        base[field] = [v for v in proposal[field] if v > 0]
+    if change == "exit_policy":
+        base["exit_policies"] = ["signal"]
+        if not rotation and len(base["exits"]) != 1:
+            raise ValueError("Use exactly one signal exit threshold for a single-asset exit comparison.")
+    else:
+        policies = proposal.get("exit_policies", [])
+        thresholds = proposal["time_machine_thresholds"]
+        if len(policies) != 1 or len(thresholds) != 1 or not 0 < thresholds[0] < 1:
+            raise ValueError("Time Machine comparisons need one exit policy and one positive threshold.")
+        base["holding_periods"] = [n for n in proposal["holding_periods"] if 1 <= n <= 48]
+    controls = variants(base, count//2, seed, frames, rotation)
+    result = []
+    for raw in controls:
+        control = Strategy.from_dict(raw)
+        if change == "exit_policy":
+            rule = control.rule if rotation else replace(control.rule, exit=None)
+            treatment = replace(control, exit_policy="bracket", rule=rule)
+        else:
+            treatment = replace(control, time_machine=proposal["time_machine_thresholds"][0])
+        result.extend([raw, treatment.to_dict()])
+    return result
+
+
 STAGES = ["tested", "profitable_after_costs", "drawdown_within_return_and_cap",
           "adequate_evidence", "consistent_across_periods"]
 
@@ -157,7 +191,7 @@ def windows(times, step, final):
 
 
 def assess(times, bars, signal, strategy, execution, cap, seed, final=False,
-           warmup=0, tm_cache=None, deadline=None, policy=None):
+           warmup=0, tm_cache=None, deadline=None, policy=None, all_periods=False):
     step = STEPS[strategy.timeframe]
     whole = simulate(times, bars, signal, strategy, execution, warmup, len(times), seed, tm_cache, deadline)
     active = times[warmup:]
@@ -177,13 +211,14 @@ def assess(times, bars, signal, strategy, execution, cap, seed, final=False,
     evidence = bool(ci and ci[0] > 0 and result["profit_concentration"] is not None
                     and result["profit_concentration"] <= policy.get("max_winner_contribution", .5))
     result["periods"] = []
-    if all(stages):
+    if all(stages) or all_periods:
         for a, b in windows(active, step, final):
             a, b = a+warmup, b+warmup
             values = simulate(times, bars, signal, strategy, execution, a, b, seed, tm_cache, deadline)
             measured = metrics(times[a:b], values, execution.capital, step)
             result["periods"].append({"start": int(times[a]), "end": int(times[b-1]+step),
                                       "return": measured["net_return"], "trades": measured["trades"]})
+    if all(stages):
         multiplier = policy.get("cost_multiplier", 1.5)
         stressed = replace(execution, fee_bps=min(9999, execution.fee_bps*multiplier),
                            slippage_bps=min(9999, execution.slippage_bps*multiplier))
@@ -222,10 +257,11 @@ def load_data(root, config, final=False):
     return data
 
 
-def run(root, ledger, memory):
+def run(root, ledger, memory, evaluate_final=True):
     config = ledger.get("config")
     deadline = config["deadline"]
     execution = Execution(**config["execution"])
+    matched = config.get("matched", False)
     build = load_data(root, config)
     frames = list(build)
     feature_cache = {frame: {} for frame in frames}
@@ -234,7 +270,7 @@ def run(root, ledger, memory):
     reserved = sum(max(.05, result["seconds"]) * 1.5
                    for row in ledger.db.execute("SELECT development FROM candidates "
                                                 "WHERE development IS NOT NULL AND final IS NULL")
-                   if (result := json.loads(row["development"]))["outcome"] == "qualified")
+                   if (result := json.loads(row["development"]))["outcome"] == "qualified") if evaluate_final else 0
     if final_ids is None:
         while time.time() < deadline - max(config["duration"]*.12, reserved):
             experiment = ledger.db.execute("SELECT * FROM experiments WHERE status='open' ORDER BY id LIMIT 1").fetchone()
@@ -244,22 +280,32 @@ def run(root, ledger, memory):
                     break
                 try:
                     if config["offline"]:
-                        proposal, provider = planner.offline(count, frames), {"model": "offline"}
+                        local = planner.matched_offline if matched else planner.offline
+                        proposal, provider = local(count, frames), {"model": "offline"}
                     else:
-                        recent = experiment_report(ledger, limit=10)
+                        all_experiments = experiment_report(ledger) if matched else None
+                        recent = all_experiments[-10:] if matched else experiment_report(ledger, limit=10)
                         history = development_history(ledger)
                         context = rich_context(recent, history)
+                        if matched:
+                            context["campaign_experiments"] = campaign_map(all_experiments)
+                            context["latest_matched_experiment"] = (
+                                {"proposal": recent[-1]["proposal"], "effects": recent[-1].get("matched")}
+                                if recent else None
+                            )
                         action = requested_action(count, bool(history))
                         proposal, provider = planner.response(
-                            config["model"], RICH_INSTRUCTIONS,
+                            config["model"], MATCHED_INSTRUCTIONS if matched else RICH_INSTRUCTIONS,
                             {"assets": config["assets"], "allowed_timeframes": frames,
                              "development_feedback": context, "requested_action": action,
-                             "prior_development_memory": memory},
-                            RICH_SCHEMA, min(deadline - max(config["duration"]*.12, reserved), time.time()+90),
+                             "prior_development_memory": memory, "max_local_backtests": config["variants"]},
+                            MATCHED_SCHEMA if matched else RICH_SCHEMA,
+                            min(deadline - max(config["duration"]*.12, reserved), time.time()+90),
                             "strategy_experiment")
                         validate_action(proposal, context, action)
-                    choices = variants(proposal, config["variants"], config["seed"]+count, frames,
-                                       rotation=len(config["assets"]) == 2)
+                    generator = matched_variants if matched else variants
+                    choices = generator(proposal, config["variants"], config["seed"]+count, frames,
+                                        rotation=len(config["assets"]) == 2)
                 except (TimeoutError, ValueError, TypeError, KeyError, urllib.error.URLError) as exc:
                     ledger.event("proposal_failure", {"error": str(exc)})
                     failures = ledger.db.execute("SELECT count(*) FROM events WHERE phase='proposal_failure'").fetchone()[0]
@@ -290,11 +336,11 @@ def run(root, ledger, memory):
                     result, _ = assess(times, bars, signal, strategy, execution, config["drawdown"], config["seed"],
                                        tm_cache=tm_cache[frame],
                                        deadline=deadline - max(config["duration"]*.12, reserved),
-                                       policy=config.get("evidence"))
+                                       policy=config.get("evidence"), all_periods=matched)
                 except EvaluationDeadline:
                     break
                 result["seconds"] = time.monotonic() - before
-                if result["outcome"] == "qualified":
+                if evaluate_final and result["outcome"] == "qualified":
                     reserved += max(.05, result["seconds"]) * 1.5
                 with ledger.db:
                     ledger.db.execute("UPDATE candidates SET development=? WHERE id=?",
@@ -304,10 +350,12 @@ def run(root, ledger, memory):
             if not outstanding:
                 with ledger.db:
                     ledger.db.execute("UPDATE experiments SET status='complete' WHERE id=?", (experiment["id"],))
+        if not evaluate_final:
+            return
         final_ids = [row["id"] for row in ledger.db.execute("SELECT id,development FROM candidates WHERE development IS NOT NULL ORDER BY id")
                      if json.loads(row["development"])["outcome"] == "qualified"]
         ledger.set("final_ids", final_ids)
-    if final_ids and time.time() < deadline:
+    if evaluate_final and final_ids and time.time() < deadline:
         del build
         final_data = load_data(root, config, final=True)
         feature_cache = {frame: {} for frame in frames}
@@ -342,11 +390,58 @@ def experiment_report(ledger, limit=-1):
                   for r in records if r["development"] is not None]
         tested.sort(key=lambda item: (item["metrics"]["outcome"] == "qualified",
                                       item["metrics"]["sharpe"] or -999), reverse=True)
-        report.append({"experiment": exp["id"], "proposal": json.loads(exp["proposal"]),
+        proposal = json.loads(exp["proposal"])
+        choices = json.loads(exp["variants"])
+        item = {"experiment": exp["id"], "proposal": proposal,
                        "provider": json.loads(exp["provider"]), "status": exp["status"],
-                       "generated": len(json.loads(exp["variants"])), "unique": len(records),
-                       "funnel": counts([t["metrics"] for t in tested]), "top_parameters": tested[:3]})
+                       "generated": len(choices), "unique": len(records),
+                       "funnel": counts([t["metrics"] for t in tested]), "top_parameters": tested[:3]}
+        if proposal.get("matched_change"):
+            item["matched"] = matched_statistics(ledger, choices, proposal["matched_change"])
+        report.append(item)
     return report
+
+
+def matched_statistics(ledger, choices, change):
+    ids = [hashlib.sha256(encode(s).encode()).hexdigest() for s in choices]
+    lookup = {}
+    for offset in range(0, len(ids), 500):
+        chunk = ids[offset:offset+500]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in ledger.db.execute(
+            f"SELECT id,development FROM candidates WHERE id IN ({placeholders}) AND development IS NOT NULL",
+            chunk,
+        ):
+            lookup[row["id"]] = json.loads(row["development"])
+    pairs = [(lookup[a], lookup[b]) for a, b in zip(ids[::2], ids[1::2])
+             if a in lookup and b in lookup]
+    deltas = [b["net_return"]-a["net_return"] for a, b in pairs]
+    windows = {}
+    for a, b in pairs:
+        control = {(w["start"], w["end"]): w["return"] for w in a["periods"]}
+        for w in b["periods"]:
+            key = (w["start"], w["end"])
+            if key in control:
+                windows.setdefault(key, []).append(w["return"]-control[key])
+
+    def median(values):
+        return float(np.median(values)) if values else None
+
+    wins = sum(delta > 1e-10 for delta in deltas)
+    losses = sum(delta < -1e-10 for delta in deltas)
+    return {
+        "change": change, "planned_pairs": len(ids)//2, "completed_pairs": len(pairs),
+        "treatment_wins": wins, "treatment_losses": losses,
+        "ties": len(pairs)-wins-losses, "median_net_return_delta": median(deltas),
+        "median_drawdown_delta": median([b["max_drawdown"]-a["max_drawdown"] for a, b in pairs]),
+        "median_closed_trade_delta": median([b["trades"]-a["trades"] for a, b in pairs]),
+        "control_qualified": sum(a["outcome"] == "qualified" for a, _ in pairs),
+        "treatment_qualified": sum(b["outcome"] == "qualified" for _, b in pairs),
+        "windows": [{"start": start, "end": end, "pairs": len(values),
+                     "treatment_wins": sum(x > 1e-10 for x in values),
+                     "median_net_return_delta": median(values)}
+                    for (start, end), values in sorted(windows.items())],
+    }
 
 
 def development_history(ledger):

@@ -73,8 +73,12 @@ def prepare(args, root, started):
         raise ValueError("Choose two different assets for rotation.")
     if args.csv and len(args.csv) != len(assets):
         raise ValueError("Pass one --csv per EUR asset, in asset order.")
-    if not 1 <= args.variants <= 1000 or args.experiments < 0 or not 0 <= args.seed < 2**32:
-        raise ValueError("Use 1–1000 variants, nonnegative experiments, and a 32-bit seed.")
+    limit = 10000 if args.matched else 1000
+    minimum = 2 if args.matched else 1
+    if not minimum <= args.variants <= limit or args.experiments < 0 or not 0 <= args.seed < 2**32:
+        raise ValueError(f"Use {minimum}–{limit} variants, nonnegative experiments, and a 32-bit seed.")
+    if args.matched and args.variants % 2:
+        raise ValueError("Matched comparisons require an even backtest budget.")
     if not 0 < args.drawdown <= 1:
         raise ValueError("Drawdown cap must be a fraction in (0, 1].")
     if not args.offline and not os.environ.get("OPENAI_API_KEY"):
@@ -129,7 +133,7 @@ def prepare(args, root, started):
             "execution": asdict(execution), "drawdown": args.drawdown, "seed": args.seed,
             "evidence": {"lower_quantile": .1, "max_winner_contribution": .5,
                          "cost_multiplier": 1.5, "positive_period_fraction": 2/3},
-            "variants": args.variants, "experiments": args.experiments,
+            "variants": args.variants, "experiments": args.experiments, "matched": args.matched,
             "model": args.model, "offline": args.offline}
 
 
@@ -169,6 +173,8 @@ def parser():
     investigate.add_argument("--fee-bps", type=float, default=10)
     investigate.add_argument("--slippage-bps", type=float, default=5)
     investigate.add_argument("--variants", type=int, default=1000)
+    investigate.add_argument("--matched", action="store_true",
+                             help="Test matched rule changes with up to 10,000 local backtests per experiment.")
     investigate.add_argument("--experiments", type=int, default=0, help="0 means continue until the time limit")
     investigate.add_argument("--seed", type=int, default=19)
     investigate.add_argument("--offline", action="store_true")

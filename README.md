@@ -32,6 +32,13 @@ By default the CLI requests the previous five years of 1h Binance spot candles, 
 
 ## Research policy
 
+Use `--matched --variants 10000` to let one proposal direct up to 10,000 local
+backtests. Each sampled parameter set gets a control and a treatment, so a
+budget of 10,000 covers up to 5,000 pairs. The planner can compare exit policies
+or the Time Machine filter. The engine samples the proposed grid using a
+recorded seed. The next proposal receives the latest comparison and a compact
+map of all development experiments, while individual results stay in SQLite.
+
 The AI receives development-only feedback from the last ten experiments, the
 strongest and weakest distinct candidates, and progress by strategy family.
 An explicit continuation reuses the same dataset, candidate ledger, and

@@ -38,11 +38,14 @@ def launch():
     duration = ask("Duration", "8h" if preset == "full" else "5m")
     variants = ask("Variants per experiment", "1000" if preset == "full" else "12")
     experiments = ask("Experiment limit (0 runs until deadline)", "0" if preset == "full" else "1")
+    matched = ask("Compare one rule change at a time (Y/N)", "N").lower() in {"y", "yes"}
 
     args = ["investigate", "--asset", asset, "--timeframes", *frames,
             "--duration", duration, "--variants", variants, "--experiments", experiments]
     if pair:
         args.extend(["--pair", pair])
+    if matched:
+        args.append("--matched")
     if preset == "offline":
         args.append("--offline")
     else:
