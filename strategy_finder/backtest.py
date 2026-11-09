@@ -39,8 +39,10 @@ def time_machine(bars, times, i, leg, strategy, execution, seed, paths=192):
     if len(candidates) < 40:
         return None
     rng = np.random.default_rng(np.random.SeedSequence([seed, int(times[i] // 3600)]))
-    draws = rng.choice(candidates, (paths, (horizon + block - 1) // block))
-    indexes = (draws[..., None] + np.arange(block)).reshape(paths, -1)[:, :horizon]
+    # An expiring bracket exits at the next open after its last active bar.
+    length = horizon + (strategy.exit_policy == "bracket")
+    draws = rng.choice(candidates, (paths, (length + block - 1) // block))
+    indexes = (draws[..., None] + np.arange(block)).reshape(paths, -1)[:, :length]
     ratios = bars[indexes, leg, :4] / bars[indexes - 1, leg, 3, None]
     growth = np.cumprod(ratios[:, :, 3], axis=1)
     preceding = np.column_stack((np.ones(paths), growth[:, :-1]))
@@ -50,15 +52,16 @@ def time_machine(bars, times, i, leg, strategy, execution, seed, paths=192):
     entry = price_paths[:, 0, 0] * (1 + slip)
     stop = entry * (1 - strategy.stop_pct)
     target = entry * (1 + strategy.target_pct)
-    stop_hit = price_paths[:, :, 2] <= stop[:, None]
-    target_hit = price_paths[:, :, 1] >= target[:, None]
+    stop_hit = price_paths[:, :horizon, 2] <= stop[:, None]
+    target_hit = price_paths[:, :horizon, 1] >= target[:, None]
     hit = stop_hit | target_hit
     first = hit.argmax(axis=1)
     rows = np.arange(paths)
     stopped = hit.any(axis=1) & stop_hit[rows, first]
     won = hit.any(axis=1) & ~stopped
+    expiry = price_paths[:, horizon, 0] if strategy.exit_policy == "bracket" else growth[:, -1]
     exits = np.where(stopped, np.minimum(stop, price_paths[rows, first, 0]),
-                     np.where(won, target, growth[:, -1]))
+                     np.where(won, target, expiry))
     payoff = exits * (1-slip) * (1-fee) / (entry * (1+fee)) - 1
     return float(won.mean()), float(stopped.mean()), float((~(won | stopped)).mean()), float(payoff.mean())
 
@@ -107,13 +110,15 @@ def simulate(times, bars, signal, strategy, execution, start, stop, seed=19, tm_
         continuous = i > 0 and times[i] - times[i-1] == step
         desired = int(signal[i-1]) if i > start and continuous else -2
         expired = leg >= 0 and strategy.max_hold and times[i] - times[entry_i] >= strategy.max_hold * step
-        if expired or (leg >= 0 and desired != -2 and desired != leg):
+        signal_exit = strategy.exit_policy == "signal" and leg >= 0 and desired not in (-2, leg)
+        if expired or signal_exit:
             close(i, bars[i, leg, 0], "timeout" if expired else "signal")
         if leg < 0 and desired >= 0 and not expired:
             permitted = True
             forecast = None
             if strategy.time_machine:
-                key = (i-1, desired, strategy.max_hold, strategy.stop_pct, strategy.target_pct)
+                key = (i-1, desired, strategy.max_hold, strategy.stop_pct, strategy.target_pct,
+                       strategy.exit_policy)
                 if key not in tm_cache:
                     if len(tm_cache) >= 60_000:
                         tm_cache.clear()

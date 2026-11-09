@@ -9,6 +9,7 @@ import random
 import sqlite3
 import time
 import urllib.error
+from dataclasses import replace
 
 import numpy as np
 
@@ -57,37 +58,57 @@ class Ledger:
             self.db.execute("INSERT INTO events(phase,details) VALUES (?,?)", (phase, encode(details)))
 
 
-def variants(proposal, count, seed, frames):
+def variants(proposal, count, seed, frames, rotation=False):
     if proposal["timeframe"] not in frames:
         raise ValueError("Planner chose a timeframe outside this investigation.")
     fields = ("lookbacks", "entries", "exits", "holding_periods", "stops", "targets", "time_machine_thresholds")
+    policies = proposal.get("exit_policies", ["signal"])
+    if not isinstance(policies, list) or not policies or not all(p in ("signal", "bracket") for p in policies):
+        raise ValueError("exit_policies must contain signal, bracket, or both.")
+    policies = list(dict.fromkeys(policies))
     choices = []
     for field in fields:
         values = proposal[field]
+        if field == "exits" and values == [] and policies == ["bracket"] and not rotation:
+            choices.append([None])
+            continue
         if not isinstance(values, list) or not 1 <= len(values) <= 24:
             raise ValueError(f"{field} must contain 1–24 choices.")
         if not all(type(v) in (int, float) and math.isfinite(v) for v in values):
             raise ValueError(f"{field} must contain finite numbers.")
         choices.append(list(dict.fromkeys(values)))
-    size = math.prod(map(len, choices))
+    grids = []
+    size = 0
+    for policy in policies:
+        grid = list(choices)
+        if policy == "bracket" and not rotation:
+            grid[2] = [None]
+        size += math.prod(map(len, grid))
+        grids.append((size, policy, grid))
     rng = random.Random(seed)
     candidates = {}
     # Evaluate paired unfiltered controls first whenever a gated variant is drawn.
     for offset in rng.sample(range(size), min(size, max(10_000, count * 30))):
+        lower = 0
+        for upper, policy, grid in grids:
+            if offset < upper:
+                offset -= lower
+                break
+            lower = upper
         parameters = []
-        for values in reversed(choices):
+        for values in reversed(grid):
             offset, index = divmod(offset, len(values))
             parameters.append(values[index])
         n, entry, exit_, hold, stop, target, threshold = reversed(parameters)
         try:
             rule = Rule(proposal["indicator"], n, entry, exit_, proposal["direction"])
             extra = Rule(**proposal["filter_rule"]) if proposal.get("filter_rule") else None
-            strategy = Strategy(proposal["timeframe"], rule, hold, stop, target, threshold, extra)
+            strategy = Strategy(proposal["timeframe"], rule, hold, stop, target, threshold, extra, policy)
         except (TypeError, ValueError):
             continue
         group = [strategy]
         if threshold:
-            group.insert(0, Strategy(strategy.timeframe, rule, hold, stop, target, 0, extra))
+            group.insert(0, replace(strategy, time_machine=0))
         group = [item.to_dict() for item in group]
         if len(candidates.keys() | {encode(item) for item in group}) > count:
             continue
@@ -223,7 +244,8 @@ def run(root, ledger, memory):
                              "recent_development_results": recent, "prior_development_memory": memory},
                             planner.SCHEMA, min(deadline - max(config["duration"]*.12, reserved), time.time()+90),
                             "strategy_experiment")
-                    choices = variants(proposal, config["variants"], config["seed"]+count, frames)
+                    choices = variants(proposal, config["variants"], config["seed"]+count, frames,
+                                       rotation=len(config["assets"]) == 2)
                 except (TimeoutError, ValueError, TypeError, KeyError, urllib.error.URLError) as exc:
                     ledger.event("proposal_failure", {"error": str(exc)})
                     failures = ledger.db.execute("SELECT count(*) FROM events WHERE phase='proposal_failure'").fetchone()[0]

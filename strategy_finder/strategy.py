@@ -11,7 +11,7 @@ class Rule:
     indicator: str
     lookback: int
     entry: float
-    exit: float
+    exit: float | None
     direction: str
 
     def __post_init__(self):
@@ -21,10 +21,13 @@ class Rule:
             raise ValueError("Lookback must be an integer from 2 to 365 bars.")
         if self.direction not in {"above", "below"}:
             raise ValueError("Invalid direction.")
-        if not all(type(x) in (int, float) and np.isfinite(x) for x in (self.entry, self.exit)):
+        thresholds = (self.entry,) if self.exit is None else (self.entry, self.exit)
+        if not all(type(x) in (int, float) and np.isfinite(x) for x in thresholds):
             raise ValueError("Thresholds must be finite numbers.")
-        if (self.direction == "above" and self.entry <= self.exit) or (self.direction == "below" and self.entry >= self.exit):
-            raise ValueError("Entry and exit must have ordered hysteresis thresholds.")
+        if self.exit is not None:
+            ordered = self.entry > self.exit if self.direction == "above" else self.entry < self.exit
+            if not ordered:
+                raise ValueError("Entry and opposing thresholds must be ordered.")
 
 
 @dataclass(frozen=True)
@@ -36,10 +39,15 @@ class Strategy:
     target_pct: float = 0.0
     time_machine: float = 0.0
     filter_rule: Rule | None = None
+    exit_policy: str = "signal"
 
     def __post_init__(self):
         if self.timeframe not in STEPS:
             raise ValueError("Unsupported timeframe.")
+        if self.exit_policy not in ("signal", "bracket"):
+            raise ValueError("Exit policy must be signal or bracket.")
+        if self.exit_policy == "signal" and self.rule.exit is None:
+            raise ValueError("Signal exit policy requires an exit threshold.")
         if type(self.max_hold) is not int or not 0 <= self.max_hold <= 365:
             raise ValueError("Invalid maximum holding period.")
         if not all(type(v) in (int, float) and np.isfinite(v) and 0 <= v < 1
@@ -47,6 +55,8 @@ class Strategy:
             raise ValueError("Invalid stop, target or Time Machine threshold.")
         if self.time_machine and not (self.stop_pct and self.target_pct and 0 < self.max_hold <= 48):
             raise ValueError("Time Machine requires both brackets and a 1–48 bar horizon.")
+        if self.exit_policy == "bracket" and not (self.stop_pct and self.target_pct):
+            raise ValueError("Bracket exit policy requires a stop and a take-profit.")
 
     @classmethod
     def from_dict(cls, raw):
@@ -57,7 +67,11 @@ class Strategy:
         return cls(**config)
 
     def to_dict(self):
-        return asdict(self)
+        spec = asdict(self)
+        if self.exit_policy == "signal":
+            # Keep existing signal strategy identities when resuming an investigation.
+            del spec["exit_policy"]
+        return spec
 
 
 def feature(prices, times, timeframe, rule):
@@ -103,10 +117,15 @@ def signals(times, bars, strategy, cache):
 
     rule = strategy.rule
     values = get(rule)
+    other = np.zeros(len(values), dtype=bool)
     if rule.direction == "above":
-        first, other = values > rule.entry, values < rule.exit
+        first = values > rule.entry
+        if rule.exit is not None:
+            other = values < rule.exit
     else:
-        first, other = values < rule.entry, values > rule.exit
+        first = values < rule.entry
+        if rule.exit is not None:
+            other = values > rule.exit
     if strategy.filter_rule:
         gate = strategy.filter_rule
         score = get(gate)
@@ -147,16 +166,20 @@ def pine(strategy, assets, capital, allocation, fee_bps, slippage_bps, start, en
              f"// Engine slippage: {slippage_bps} bps per side. Pine slippage uses ticks.",
              f"price = {price}", f"score = {expr(rule)}",
              f"enter = score {entry} {rule.entry}{gate}",
-             f"leave = score {exit_} {rule.exit}",
              f"active = time >= {start*1000} and time_close < {end*1000} and barstate.isconfirmed"]
+    if rule.exit is not None:
+        lines.append(f"opposing = score {exit_} {rule.exit}")
     if diagnostic:
         lines.extend(["// Raw signal only. Python applies the portfolio and simulation rules.",
                       'plot(score, "Signal")',
-                      'plotshape(active and enter, title="Asset A / long setup")',
-                      'plotshape(active and leave, title="Asset B / exit setup")'])
+                      'plotshape(active and enter, title="Asset A / long setup")'])
+        if rule.exit is not None:
+            title = "Asset B entry setup" if strategy.exit_policy == "bracket" else "Asset B / exit setup"
+            lines.append(f'plotshape(active and opposing, title="{title}")')
         return "\n".join(lines) + "\n", "diagnostic"
-    lines.extend(['if active and enter and strategy.position_size == 0', '    strategy.entry("Long", strategy.long)',
-                  'if active and leave and strategy.position_size > 0', '    strategy.close("Long")'])
+    lines.extend(['if active and enter and strategy.position_size == 0', '    strategy.entry("Long", strategy.long)'])
+    if strategy.exit_policy == "signal":
+        lines.extend(['if active and opposing and strategy.position_size > 0', '    strategy.close("Long")'])
     if strategy.max_hold:
         lines.extend([f'if active and strategy.position_size > 0 and bar_index - strategy.opentrades.entry_bar_index(0) + 1 >= {strategy.max_hold}',
                       '    strategy.close("Long", comment="Time exit")'])

@@ -30,7 +30,8 @@ def shortlist(rows, maximum=10):
     groups = set()
     for item in rows:
         spec = item["strategy"]
-        group = (spec["timeframe"], spec["rule"]["indicator"], spec["rule"]["direction"])
+        group = (spec["timeframe"], spec["rule"]["indicator"], spec["rule"]["direction"],
+                 spec.get("exit_policy", "signal"))
         if group in groups:
             deferred.append(item)
         else:
@@ -88,10 +89,18 @@ def _details(item, strategy, root, config, datasets, execution):
         "signal_input": "asset A close divided by asset B close" if len(config["assets"]) > 1 else "asset close",
         "enter_a": f"{strategy.rule.indicator}({strategy.rule.lookback}) "
                    f"{'>' if strategy.rule.direction == 'above' else '<'} {strategy.rule.entry}",
-        "switch_to_b_or_cash": f"{strategy.rule.indicator}({strategy.rule.lookback}) "
-                              f"{'<' if strategy.rule.direction == 'above' else '>'} {strategy.rule.exit}",
+        "exit_policy": strategy.exit_policy,
+        "stop_pct": strategy.stop_pct,
+        "take_profit_pct": strategy.target_pct,
+        "max_holding_bars": strategy.max_hold,
         "execution": "Evaluate at candle close and submit at the next consecutive candle open.",
     }
+    if strategy.rule.exit is not None:
+        key = "enter_b_when_flat" if strategy.exit_policy == "bracket" else "switch_to_b_or_cash"
+        comparison = "<" if strategy.rule.direction == "above" else ">"
+        item["readable_rules"][key] = (
+            f"{strategy.rule.indicator}({strategy.rule.lookback}) {comparison} {strategy.rule.exit}"
+        )
     for label, a, b in (("development", 0, split), ("final", split, len(times)), ("full", 0, len(times))):
         active_times = times[a:b]
         result = simulate(times, bars, signal, strategy, execution, a, b, config["seed"])

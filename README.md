@@ -31,6 +31,13 @@ By default the CLI requests the previous five years of 1h Binance spot candles, 
 
 ## Research policy
 
+The AI can propose signal exits, bracket exits, or both within an experiment.
+Signal exits can close or rotate a holding when the opposing condition fires.
+Bracket exits require a stop-loss and take-profit measured from the entry fill.
+An optional holding limit can also close the position. For rotation with bracket
+exits, the opposing signal can select asset B while the strategy is flat.
+Time Machine requires a holding limit of 1–48 bars to simulate the bracket.
+
 - The development/final boundary is the 80% point of observed common history, rounded down to a UTC day. The planner receives development metrics only. Final candidates and thresholds are frozen before opening the final snapshot. Separate Parquet files prevent accidental reads in the discovery code. OS users with access to the run directory can still read both snapshots.
 - In the development stage, fixed rules run across the whole period and in six-month windows after the first year. Indicators can warm up from prior candles. Each scored window starts flat, first signals may fill from its second candle, and ending holdings are marked at the final close. Holdout consistency uses quarterly windows. There is no statistical fitting stage for the current rule language.
 - The funnel tests positive net return, drawdown no greater than both net return and the configured ceiling (30% by default), evidence quality, and consistency. The evidence stage uses a positive lower bound of an 80% moving-block bootstrap interval, no single closed winner contributing over half the gross winning P&L, and profitability at 1.5× estimated costs. The block length is at least 14 days and extends for slower trading based on median holding time. At least two-thirds of a minimum of two available windows must be profitable. This bootstrap is a diagnostic and does not correct for adaptive search or every possible source of dependence.

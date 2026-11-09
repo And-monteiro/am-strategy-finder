@@ -25,6 +25,7 @@ SCHEMA = obj({
     "indicator": {"type": "string", "enum": FAMILIES},
     "direction": {"type": "string", "enum": ["above", "below"]},
     "lookbacks": array(INTEGER), "entries": array(NUMBER), "exits": array(NUMBER),
+    "exit_policies": array({"type": "string", "enum": ["signal", "bracket"]}),
     "holding_periods": array(INTEGER), "stops": array(NUMBER), "targets": array(NUMBER),
     "time_machine_thresholds": array(NUMBER),
     "filter_rule": {"anyOf": [{"type": "null"}, obj({
@@ -35,14 +36,21 @@ SCHEMA = obj({
 
 INSTRUCTIONS = """Design one falsifiable trading experiment using completed candles.
 Choose allowed timeframe and give parameter lists for the deterministic search.
-All entries/exits are strict threshold comparisons: above enters above entry and leaves
-below exit; below enters below entry and leaves above exit. Use ordered thresholds
-(entry > exit for above, entry < exit for below). zscore is (close - mean)/population SD.
+Choose exit_policies: ["signal"], ["bracket"], or both to compare exit policies.
+For signal, the opposing threshold exits to cash or rotates to asset B. For bracket,
+the held position exits only at the stop, take-profit, or optional holding limit.
+Both stop and target must be positive. On a single asset, bracket ignores exits;
+provide [] for exits if testing only bracket. In rotation, the opposing threshold
+is still needed as an entry signal for asset B while flat.
+Thresholds are strict comparisons: above enters A above entry and triggers the
+opposing condition below exit; below reverses both comparisons. Use ordered
+thresholds (entry > exit for above, entry < exit for below).
+zscore is (close - mean)/population SD.
 return is close / close[n] - 1; sma_distance is close / SMA - 1; breakout compares
 close to the highest previous n closes as a fractional distance; volatility is
 population SD of the last n one-bar returns. Lookbacks are 2–365. Optional filter_rule
-gates only the primary entry on its own entry threshold. With two legs, signal A
-uses the price ratio, and the exit condition selects B instead of cash.
+gates only the primary entry on its own entry threshold. With two legs the
+indicator uses the asset A / asset B price ratio.
 Zero disables hold limit, stop, target, or simulation. Nonzero Time Machine requires
 stop, target and max hold 1–48. Brackets and probabilities are fractions. Include
 zero Time Machine threshold so its contribution can be compared. Use recent results

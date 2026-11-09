@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,51 @@ from strategy_finder.strategy import Rule, Strategy, pine, signals
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_bracket_ignores_opposing_signal_until_take_profit(self):
+        times = np.arange(5)*HOUR
+        bars = np.array([[[100, 101, 99, 100, 1]],
+                         [[100, 104, 99, 103, 1]],
+                         [[104, 105, 102, 103, 1]],
+                         [[104, 121, 103, 118, 1]],
+                         [[119, 120, 118, 119, 1]]], dtype=float)
+        execution = Execution(fee_bps=0, slippage_bps=0)
+        signal = [0, -1, -2, -2, -2]
+        original = Strategy("1h", Rule("return", 2, .1, 0, "above"),
+                            stop_pct=.1, target_pct=.2)
+        for policy, timestamp, reason, price in (("signal", 2, "signal", 104),
+                                                 ("bracket", 3, "target", 120)):
+            spec = replace(original, exit_policy=policy)
+            trade, = simulate(times, bars, signal, spec, execution, 0, 5)["trades"]
+            self.assertEqual((trade["exit_timestamp"], trade["reason"]), (times[timestamp], reason))
+            self.assertAlmostEqual(trade["exit"], price)
+
+    def test_bracket_rotation_uses_second_signal_only_when_flat(self):
+        times = np.arange(5)*HOUR
+        bars = np.full((5, 2, 5), 100.)
+        bars[3, 0, 2] = 89.
+        strategy = Strategy("1h", Rule("return", 2, .1, 0, "above"),
+                            stop_pct=.1, target_pct=.2, exit_policy="bracket")
+        result = simulate(times, bars, [0, 1, 1, 1, -2], strategy, Execution(), 0, 5)
+        trade, = result["trades"]
+        self.assertEqual((trade["leg"], trade["reason"], trade["exit_timestamp"]), (0, "stop", times[3]))
+        self.assertEqual(result["open_position"]["leg"], 1)
+        self.assertEqual(result["open_position"]["entry_timestamp"], times[4])
+
+    def test_proposed_bracket_has_no_signal_exit_and_keeps_time_machine_control(self):
+        proposal = dict(offline(0, ["4h"]), exit_policies=["bracket"], exits=[],
+                        lookbacks=[8], entries=[-1], stops=[.05], targets=[.1],
+                        holding_periods=[12], time_machine_thresholds=[.3])
+        choices = variants(proposal, 4, 19, ["4h"])
+        self.assertEqual(len(choices), 2)
+        for item in choices:
+            self.assertEqual(item["exit_policy"], "bracket")
+            self.assertIsNone(item["rule"]["exit"])
+        ungated = Strategy.from_dict(next(item for item in choices if not item["time_machine"]))
+        code, _ = pine(ungated, ["BTCEUR"], 1000, 1, 10, 5, 0, 10000)
+        self.assertNotIn("opposing", code)
+        self.assertIn('strategy.exit("Bracket"', code)
+        self.assertIn('comment="Time exit"', code)
+
     def test_next_open_costs_and_stop_precedence(self):
         times = np.arange(3) * HOUR
         bars = np.array([[[80, 105, 80, 100, 1]],
