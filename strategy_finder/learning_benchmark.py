@@ -85,7 +85,7 @@ def budgeted_response(database, ceiling, model, instructions, payload, schema, d
     return proposal, response
 
 
-def prepare(root, assets, start, end, frames):
+def prepare(root, assets, start, end, frames, fixed_allocation=None):
     for asset in assets:
         if not asset.isascii() or not asset.isalnum():
             raise ValueError("Benchmark assets must be ticker symbols.")
@@ -93,9 +93,11 @@ def prepare(root, assets, start, end, frames):
         setup.mkdir(parents=True, exist_ok=True)
         if (setup / "config.json").exists():
             raise ValueError(f"Dataset already frozen at {setup}. Use a new benchmark directory.")
-        args = cli_parser().parse_args(["investigate", "--offline", "--asset", asset,
-                                        "--start", start, "--end", end,
-                                        "--duration", "30m", "--timeframes", *frames])
+        argv = ["investigate", "--offline", "--asset", asset, "--start", start, "--end", end,
+                "--duration", "30m", "--timeframes", *frames]
+        if fixed_allocation is not None:
+            argv.extend(["--fixed-allocation", "--allocation", str(fixed_allocation)])
+        args = cli_parser().parse_args(argv)
         config = prepare_data(args, setup, time.time())
         write_json(setup / "config.json", config)
 
@@ -305,7 +307,10 @@ def discover(root, model, seeds, workers, arms, budget, batch=50, hours=.5, max_
             shared = [submit(pool, setup, seed, "shared-checkpoint") for setup in configs for seed in seeds]
         else:
             shared = []
-        standard = [submit(pool, *args) for args in jobs if not fork or args[2] not in ("ai_rich", "memory_reset")]
+        # Model proposals are sequential within a search. Start those searches
+        # first so quicker local baselines do not delay the later API calls.
+        standard = [submit(pool, *args) for args in sorted(jobs, key=lambda job: job[2] == "random")
+                    if not fork or args[2] not in ("ai_rich", "memory_reset")]
         for future in as_completed(shared):
             if future.result()["status"] != "complete":
                 complete = False
@@ -403,6 +408,7 @@ def write_summary(root, rows, budget):
                   "|---|---|---:|---:|---:|"])
     for left, right, pick in [
         ("ai_no_feedback", "random", "leader"),
+        ("ai_rich", "random", "leader"),
         ("ai_last_five", "ai_no_feedback", "leader"),
         ("ai_rich", "ai_last_five", "leader"),
         ("ai_rich", "ai_no_feedback", "leader"),
@@ -440,6 +446,8 @@ def main():
     parser.add_argument("--start")
     parser.add_argument("--end")
     parser.add_argument("--timeframes", nargs="+", default=["1d"])
+    parser.add_argument("--fixed-allocation", type=float,
+                        help="During prepare, fix each entry to this fraction of equity.")
     args = parser.parse_args()
     if args.budget < 4 or args.budget % 2:
         parser.error("Budget must be an even number at least four.")
@@ -448,7 +456,7 @@ def main():
     if args.phase == "prepare":
         if not all((args.assets, args.start, args.end)):
             parser.error("Prepare requires --assets, --start, and --end.")
-        prepare(args.root, args.assets, args.start, args.end, args.timeframes)
+        prepare(args.root, args.assets, args.start, args.end, args.timeframes, args.fixed_allocation)
     elif args.phase == "discover":
         load_openai_settings(Path(".env"))
         complete = discover(args.root, args.model, args.seeds, args.workers, args.arms, args.budget,

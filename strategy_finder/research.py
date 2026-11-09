@@ -177,9 +177,8 @@ def assess(times, bars, signal, strategy, execution, cap, seed, final=False,
             result["periods"].append({"start": int(times[a]), "end": int(times[b-1]+step),
                                       "return": measured["net_return"], "trades": measured["trades"]})
         multiplier = policy.get("cost_multiplier", 1.5)
-        stressed = Execution(execution.capital, execution.allocation, execution.risk,
-                             min(9999, execution.fee_bps*multiplier),
-                             min(9999, execution.slippage_bps*multiplier))
+        stressed = replace(execution, fee_bps=min(9999, execution.fee_bps*multiplier),
+                           slippage_bps=min(9999, execution.slippage_bps*multiplier))
         cost_test = simulate(times, bars, signal, strategy, stressed, warmup, len(times), seed, deadline=deadline)
         result["stress_return"] = cost_test["equity"][-1] / execution.capital - 1
         evidence &= result["stress_return"] > 0

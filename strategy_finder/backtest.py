@@ -17,14 +17,23 @@ class Execution:
     risk: float = 0.005
     fee_bps: float = 10
     slippage_bps: float = 5
+    fixed_allocation: bool = False
 
     def __post_init__(self):
-        if not all(type(x) in (int, float) and np.isfinite(x) for x in vars(self).values()):
+        numbers = (self.capital, self.allocation, self.risk, self.fee_bps, self.slippage_bps)
+        if not all(type(x) in (int, float) and np.isfinite(x) for x in numbers):
             raise ValueError("Execution values must be finite numbers.")
+        if type(self.fixed_allocation) is not bool:
+            raise ValueError("Fixed allocation must be a boolean.")
         if not self.capital > 0 or not 0 < self.allocation <= 1 or not 0 < self.risk <= 1:
             raise ValueError("Invalid capital, allocation or stop risk.")
         if not 0 <= self.fee_bps < 10000 or not 0 <= self.slippage_bps < 10000:
             raise ValueError("Invalid cost assumption.")
+
+    def allocation_for_stop(self, stop_pct):
+        if self.fixed_allocation or not stop_pct:
+            return self.allocation
+        return min(self.allocation, self.risk / stop_pct)
 
 
 def time_machine(bars, times, i, leg, strategy, execution, seed, paths=192):
@@ -130,7 +139,7 @@ def simulate(times, bars, signal, strategy, execution, start, stop, seed=19, tm_
                                       "p_target": forecast[0], "p_stop": forecast[1], "p_neither": forecast[2],
                                       "expected_net_return": forecast[3], "accepted": permitted})
             if permitted:
-                allocation = min(execution.allocation, execution.risk / strategy.stop_pct) if strategy.stop_pct else execution.allocation
+                allocation = execution.allocation_for_stop(strategy.stop_pct)
                 basis = cash * allocation
                 entry_price = bars[i, desired, 0] * (1+slip)
                 shares = basis / (entry_price * (1+fee_rate))

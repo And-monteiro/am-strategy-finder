@@ -14,6 +14,16 @@ from strategy_finder.strategy import Rule, Strategy, pine, signals
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_fixed_allocation_does_not_change_with_stop_distance(self):
+        times = np.arange(3)*HOUR
+        bars = np.full((3, 1, 5), 100.)
+        execution = Execution(allocation=.1, fee_bps=0, slippage_bps=0, fixed_allocation=True)
+        for distance in (0, .01, .20):
+            strategy = Strategy("1h", Rule("return", 2, .1, 0, "above"), stop_pct=distance)
+            outcome = simulate(times, bars, [0, -2, -2], strategy, execution, 0, 3)
+            self.assertAlmostEqual(outcome["open_position"]["basis"], 100)
+        self.assertAlmostEqual(Execution(allocation=.1).allocation_for_stop(.20), .025)
+
     def test_rich_feedback_keeps_older_winner_and_excludes_holdout(self):
         good = Strategy("1d", Rule("return", 3, .1, 0, "above")).to_dict()
         bad = Strategy("1d", Rule("zscore", 5, .5, 0, "above")).to_dict()

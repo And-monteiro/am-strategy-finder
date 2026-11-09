@@ -81,7 +81,8 @@ def prepare(args, root, started):
         raise ValueError("Set OPENAI_API_KEY or choose --offline.")
     if not args.offline and not args.model:
         raise ValueError("Set OPENAI_MODEL or pass --model for Structured Outputs.")
-    execution = Execution(args.capital, args.allocation, args.risk, args.fee_bps, args.slippage_bps)
+    execution = Execution(args.capital, args.allocation, args.risk, args.fee_bps, args.slippage_bps,
+                          args.fixed_allocation)
     now_hour = int(started) // HOUR * HOUR
     end = args.end if args.end is not None else now_hour
     if end > now_hour:
@@ -161,6 +162,8 @@ def parser():
     investigate.add_argument("--duration", type=duration, default=8*3600)
     investigate.add_argument("--capital", type=float, default=1000)
     investigate.add_argument("--allocation", type=float, default=1)
+    investigate.add_argument("--fixed-allocation", action="store_true",
+                             help="Allocate the same fraction at every entry, independent of stop distance.")
     investigate.add_argument("--risk", type=float, default=.005)
     investigate.add_argument("--drawdown", type=float, default=.30)
     investigate.add_argument("--fee-bps", type=float, default=10)

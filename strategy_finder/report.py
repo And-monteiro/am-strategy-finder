@@ -120,7 +120,7 @@ def _details(item, strategy, root, config, datasets, execution):
             item[label]["target_calibration"] = _calibration(times, bars, result["forecasts"],
                                                             strategy, execution, b)
     write_json(path / "strategy.json", item)
-    allocation = min(execution.allocation, execution.risk / strategy.stop_pct) if strategy.stop_pct else execution.allocation
+    allocation = execution.allocation_for_stop(strategy.stop_pct)
     script, status = pine(strategy, config["assets"], execution.capital, allocation, execution.fee_bps,
                           execution.slippage_bps, int(times[0]), int(times[-1])+step)
     (path / "strategy.pine").write_text(script, encoding="utf-8")
@@ -173,7 +173,7 @@ def publish(root, ledger, summarize=True):
         for identity, item in artifacts.items():
             strategy = Strategy.from_dict(item["strategy"])
             times, bars, split = datasets[strategy.timeframe]
-            allocation = min(execution.allocation, execution.risk / strategy.stop_pct) if strategy.stop_pct else execution.allocation
+            allocation = execution.allocation_for_stop(strategy.stop_pct)
             _, status = pine(strategy, config["assets"], execution.capital, allocation, execution.fee_bps,
                              execution.slippage_bps, int(times[0]), int(times[-1])+STEPS[strategy.timeframe])
             item["pine_status"] = status

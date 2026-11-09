@@ -89,3 +89,8 @@ guard is shared by all workers in that directory and prices in-flight requests
 conservatively. Keep the same directory, model, seeds, budget, and batch size to
 resume discovery. Pass the same budget, seeds, and arms to `evaluate`. The large
 benchmark freezes picks at 300, 1,000, 3,000, and 10,000 unique evaluations.
+
+Pass `--fixed-allocation 0.10` to benchmark `prepare` to size every new position
+at 10% of equity, regardless of whether it has a stop or how far away the stop
+is. Use the same sizing policy for every comparison arm. Trade timing and the
+distance to exits can still produce different realized exposures and drawdowns.
