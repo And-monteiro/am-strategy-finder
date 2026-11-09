@@ -8,12 +8,27 @@ import numpy as np
 from strategy_finder.backtest import Execution, metrics, simulate, time_machine
 from strategy_finder.data import DAY, HOUR, Candle, align, load_snapshot, save_snapshot
 from strategy_finder.feedback import rich_context, validate_action
+from strategy_finder.matched_planner_test import choose_program
 from strategy_finder.research import assess, matched_variants, variants
 from strategy_finder.planner import matched_offline, offline
 from strategy_finder.strategy import Rule, Strategy, pine, signals
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_programmatic_planner_uses_paired_window_evidence(self):
+        def experiment(number, choice, deltas, full_delta):
+            return {"experiment": number, "proposal": {"choice": choice}, "effects": {
+                "windows": [{"median_net_return_delta": x} for x in deltas],
+                "median_net_return_delta": full_delta, "median_drawdown_delta": 0}}
+        context = {"experiments": [
+            experiment(1, "return:exit_policy", [.01, -.02, -.03], .04),
+            experiment(2, "return:time_machine", [.01, .02, -.01], .01),
+        ]}
+        decision = choose_program(context, ["return:exit_policy", "return:time_machine"])
+        self.assertEqual((decision["choice"], decision["parent"]), ("return:time_machine", 2))
+        exploration = choose_program(context, ["zscore:exit_policy", "volatility:exit_policy"])
+        self.assertEqual((exploration["choice"], exploration["parent"]), ("zscore:exit_policy", None))
+
     def test_matched_pairs_keep_shared_settings_and_unique_candidates(self):
         proposal = matched_offline(0, ["1d"])
         exit_pairs = matched_variants(proposal, 12, 19, ["1d"])

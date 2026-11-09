@@ -101,3 +101,18 @@ Pass `--fixed-allocation 0.10` to benchmark `prepare` to size every new position
 at 10% of equity, regardless of whether it has a stop or how far away the stop
 is. Use the same sizing policy for every comparison arm. Trade timing and the
 distance to exits can still produce different realized exposures and drawdowns.
+
+The matched-planner comparison gives Luna and a rules-based planner the same
+initial experiment, choices, matched sampler, and unique-candidate budgets.
+Prepare a daily, single-asset snapshot at fixed 10% allocation, then run the
+discovery and evaluation phases separately:
+
+```text
+python -m strategy_finder.learning_benchmark prepare runs/matched-test --assets BNB --start 2021-11-01 --end 2026-11-01 --timeframes 1d --fixed-allocation 0.10
+python -m strategy_finder.matched_planner_test discover runs/matched-test --asset BNB
+python -m strategy_finder.matched_planner_test evaluate runs/matched-test --asset BNB
+```
+
+Discovery checkpoints both branches in SQLite. Evaluation checks the trial
+budgets and frozen picks before opening the holdout. It writes `summary.md` and
+`results.json` beside the protocol and both decision histories.
