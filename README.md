@@ -116,3 +116,18 @@ python -m strategy_finder.matched_planner_test evaluate runs/matched-test --asse
 Discovery checkpoints both branches in SQLite. Evaluation checks the trial
 budgets and frozen picks before opening the holdout. It writes `summary.md` and
 `results.json` beside the protocol and both decision histories.
+
+The long benchmark runs four independent planners for eight hours per prepared
+market, with three workers per arm by default. Prepare daily snapshots with
+fixed 10% allocation and put the markets in non-overlapping holdout order.
+
+```text
+python -m strategy_finder.long_learning_benchmark run runs/long-learning-benchmark --markets DOT AVAX SUI
+python -m strategy_finder.long_learning_benchmark status runs/long-learning-benchmark --watch
+```
+
+Discovery saves the cumulative leader and the latest batch leader in each
+arm's SQLite ledger. The runner evaluates the sealed holdouts automatically
+after all markets finish and writes `summary.md`, `checkpoint-results.csv`,
+and `equal-trial-results.csv`. On Windows, double-click
+`Watch Learning Benchmark.bat` to see progress for that directory.

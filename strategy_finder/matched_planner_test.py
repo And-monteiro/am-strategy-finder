@@ -73,14 +73,20 @@ def evaluate_chunk(chunk, seed):
 
 
 def make_choices(ledger, proposal, budget, seed):
-    seen = {row[0] for row in ledger.db.execute("SELECT id FROM candidates")}
     for factor in (1, 2, 4):
         generated = matched_variants(proposal, budget*factor, seed, ["1d"])
+        ids = [identity(spec) for spec in generated]
+        seen = set()
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset+500]
+            placeholders = ",".join("?" for _ in chunk)
+            seen.update(row[0] for row in ledger.db.execute(
+                f"SELECT id FROM candidates WHERE id IN ({placeholders})", chunk))
         chosen = []
-        for a, b in zip(generated[::2], generated[1::2]):
-            if identity(a) in seen or identity(b) in seen:
+        for offset in range(0, len(generated), 2):
+            if ids[offset] in seen or ids[offset+1] in seen:
                 continue
-            chosen.extend((a, b))
+            chosen.extend(generated[offset:offset+2])
             if len(chosen) == budget:
                 return chosen
     raise ValueError("The matched grid could not supply a complete fresh trial budget.")
