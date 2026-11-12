@@ -148,5 +148,10 @@ holdout. The hourly report counts distinct trade histories and tracks new
 qualifiers at 10% and 15% annualized net return, below 30% drawdown and above
 0.8 Sharpe. Its Time Machine actions use a 24-hour forecast at 20%, 30%, or
 40% target-hit probability. The holding limit remains optional.
+
+For the 4h spot comparison, prepare with `--timeframes 4h --fixed-allocation 1`
+and run with `--timeframe 4h --allocation 1 --batch 5000 --max-batches 20`.
+The Time Machine forecast still spans 24 hours.
 Double-click `Watch Learning Benchmark.bat` to monitor the
-`runs/hourly-learning-20` run.
+`runs/4h-full-allocation` run. Pass `-Run runs/hourly-learning-20` to open
+the earlier hourly run.

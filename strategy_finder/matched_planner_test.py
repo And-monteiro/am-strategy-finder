@@ -15,7 +15,8 @@ from pathlib import Path
 from . import planner
 from .backtest import Execution
 from .feedback import campaign_map, development_score
-from .hourly_forecasts import HORIZON, STOPS, TARGETS, load_lookup
+from .data import DAY, STEPS
+from .hourly_forecasts import STOPS, TARGETS, load_lookup
 from .learning_benchmark import budgeted_response
 from .research import Ledger, assess, encode, experiment_report, load_data, matched_variants, write_json
 from .strategy import Strategy, signals
@@ -56,13 +57,13 @@ def recipe(action, parent=None, reason=None, expectation=None, timeframe="1d"):
         "exit_policies": ["signal", "bracket"] if change == "exit_policy" else ["bracket"],
         "time_machine_thresholds": [.20] if tm else [0], "filter_rule": None,
     }
-    if timeframe == "1h":
+    if timeframe in ("1h", "4h"):
         scale = 1 if family == "zscore" else .25
         spec.update(entries=[x*scale for x in entries], exits=[x*scale for x in spec["exits"]],
                     holding_periods=[0, 12, 24, 48, 96, 168],
                     stops=list(STOPS), targets=list(TARGETS))
         if tm:
-            spec.update(forecast_bars=HORIZON, time_machine_thresholds=[int(change.split("_")[-1])/100])
+            spec.update(forecast_bars=DAY//STEPS[timeframe], time_machine_thresholds=[int(change.split("_")[-1])/100])
         if change == "entry_confirmation":
             indicator = "sma_distance" if family != "sma_distance" else "return"
             spec["filter_rule"] = {"indicator": indicator, "lookback": 48, "entry": 0,
@@ -89,7 +90,7 @@ def evaluate_chunk(chunk, seed):
                             tm_cache=_WORKER["forecasts"], policy=_WORKER["evidence"], all_periods=True,
                             forecast_lookup=_WORKER.get("forecast_lookup"),
                             stress_forecast_lookup=_WORKER.get("stress_forecast_lookup"))
-        if strategy.timeframe == "1h":
+        if strategy.timeframe in ("1h", "4h"):
             record_behavior(metrics, result)
         metrics["seconds"] = time.perf_counter()-before
         results.append((encode(metrics), candidate_id))

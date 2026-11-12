@@ -79,24 +79,27 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(treatment, replace(control, filter_rule=Rule(**proposal["filter_rule"])))
 
     def test_hourly_forecast_grid_matches_direct_forecasts(self):
-        times = np.arange(100)*HOUR
         close = 100+2*np.sin(np.arange(100))
         bars = np.repeat(close[:, None, None], 5, axis=2)
         bars[:, 0, 1] *= 1.01
         bars[:, 0, 2] *= .99
         i, seed = 99, 19
-        prices, _ = forecast_paths(bars, times, i, 0, 24, HOUR, True, seed)
-        proposal = recipe("return:time_machine_30", timeframe="1h")
-        stops, targets = proposal["stops"][::7], proposal["targets"][::7]
-        for execution in (Execution(), Execution(fee_bps=15, slippage_bps=7.5)):
-            grid = summarize_grid(prices, execution, stops, targets)
-            for a, stop in enumerate(stops):
-                for b, target in enumerate(targets):
-                    strategy = Strategy("1h", Rule("return", 10, .01, None, "above"), stop_pct=stop,
-                                        target_pct=target, time_machine=.30, exit_policy="bracket",
-                                        forecast_bars=24)
-                    np.testing.assert_array_equal(
-                        grid[a, b], time_machine(bars, times, i, 0, strategy, execution, seed))
+        for frame, step in (("1h", HOUR), ("4h", 4*HOUR)):
+            times = np.arange(100)*step
+            proposal = recipe("return:time_machine_30", timeframe=frame)
+            horizon = proposal["forecast_bars"]
+            self.assertEqual(horizon*step, DAY)
+            prices, _ = forecast_paths(bars, times, i, 0, horizon, step, True, seed)
+            stops, targets = proposal["stops"][::7], proposal["targets"][::7]
+            for execution in (Execution(), Execution(fee_bps=15, slippage_bps=7.5)):
+                grid = summarize_grid(prices, execution, stops, targets)
+                for a, stop in enumerate(stops):
+                    for b, target in enumerate(targets):
+                        strategy = Strategy(frame, Rule("return", 10, .01, None, "above"), stop_pct=stop,
+                                            target_pct=target, time_machine=.30, exit_policy="bracket",
+                                            forecast_bars=horizon)
+                        np.testing.assert_array_equal(
+                            grid[a, b], time_machine(bars, times, i, 0, strategy, execution, seed))
 
     def test_rich_feedback_keeps_older_winner_and_excludes_holdout(self):
         good = Strategy("1d", Rule("return", 3, .1, 0, "above")).to_dict()

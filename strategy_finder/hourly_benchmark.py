@@ -1,4 +1,4 @@
-"""Development diversity and frozen shortlist for the hourly four-arm benchmark."""
+"""Development diversity and frozen shortlist for intraday four-arm benchmarks."""
 import json
 
 from .research import write_json
@@ -54,7 +54,10 @@ def freeze_shortlist(ledger):
 def write_summary(root, setups, arms, read, rows):
     development = []
     starting_counts = {}
-    lines = ["# Hourly four-arm benchmark", "",
+    frames = ", ".join(sorted({frame for _, config in setups for frame in config["datasets"]}))
+    allocation = setups[0][1]["execution"]["allocation"]
+    lines = [f"# {frames} four-arm benchmark", "",
+             f"Fixed position sizing uses {allocation:.0%} of available cash per entry.",
              "Returns are annualized and net of modeled fees and slippage. "
              "The return tiers also require drawdown below 30% and Sharpe above 0.8.",
              "", "| Market | Arm | Follow-up trials | New histories | New at 10% | New at 15% |",

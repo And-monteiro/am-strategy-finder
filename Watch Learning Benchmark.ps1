@@ -1,5 +1,5 @@
 param(
-    [string]$Run = 'runs/hourly-learning-20',
+    [string]$Run = 'runs/4h-full-allocation',
     [switch]$Once
 )
 

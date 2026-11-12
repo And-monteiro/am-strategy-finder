@@ -1,4 +1,4 @@
-"""Precompute the common hourly Time Machine forecast grid once per snapshot."""
+"""Precompute the common intraday Time Machine forecast grid once per snapshot."""
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
 from hashlib import sha256
@@ -6,57 +6,60 @@ from hashlib import sha256
 import numpy as np
 
 from .backtest import Execution, forecast_paths
-from .data import HOUR
+from .data import DAY, STEPS
 from .research import encode, load_data
 
-HORIZON = 24
 STOPS = tuple(x/1000 for x in range(5, 41, 2))
 TARGETS = tuple(x/1000 for x in range(8, 81, 4))
 WORKER = {}
 
 
 def summarize_grid(price_paths, execution, stops=STOPS, targets=TARGETS):
+    horizon = price_paths.shape[1]-1
     slip = execution.slippage_bps / 10000
     fee = execution.fee_bps / 10000
     entry = price_paths[:, 0, 0]*(1+slip)
     floors = entry[:, None]*(1-np.asarray(stops))
     ceilings = entry[:, None]*(1+np.asarray(targets))
-    lows = price_paths[:, :HORIZON, 2, None] <= floors[:, None, :]
-    highs = price_paths[:, :HORIZON, 1, None] >= ceilings[:, None, :]
-    first_stop = np.where(lows.any(axis=1), lows.argmax(axis=1), HORIZON)
-    first_target = np.where(highs.any(axis=1), highs.argmax(axis=1), HORIZON)
-    stopped = (first_stop[:, :, None] < HORIZON) & (first_stop[:, :, None] <= first_target[:, None, :])
-    won = (first_target[:, None, :] < HORIZON) & ~stopped
+    lows = price_paths[:, :horizon, 2, None] <= floors[:, None, :]
+    highs = price_paths[:, :horizon, 1, None] >= ceilings[:, None, :]
+    first_stop = np.where(lows.any(axis=1), lows.argmax(axis=1), horizon)
+    first_target = np.where(highs.any(axis=1), highs.argmax(axis=1), horizon)
+    stopped = (first_stop[:, :, None] < horizon) & (first_stop[:, :, None] <= first_target[:, None, :])
+    won = (first_target[:, None, :] < horizon) & ~stopped
     openings = np.take_along_axis(price_paths[:, :, 0], first_stop, axis=1)
     exits = np.where(stopped, np.minimum(floors, openings)[:, :, None],
-                     np.where(won, ceilings[:, None, :], price_paths[:, HORIZON, 0, None, None]))
+                     np.where(won, ceilings[:, None, :], price_paths[:, horizon, 0, None, None]))
     payoff = exits*(1-slip)*(1-fee)/(entry[:, None, None]*(1+fee))-1
     return np.stack((won.mean(axis=0), stopped.mean(axis=0), (~(won | stopped)).mean(axis=0),
                      np.ascontiguousarray(payoff.transpose(1, 2, 0)).mean(axis=-1)), axis=-1)
 
 
 def grid_path(setup, config, seed):
-    inputs = (config["datasets"]["1h"]["development_hash"], config["execution"],
-              config.get("evidence", {}).get("cost_multiplier", 1.5), HORIZON, STOPS, TARGETS)
+    frame, = config["datasets"]
+    inputs = (config["datasets"][frame]["development_hash"], config["execution"],
+              config.get("evidence", {}).get("cost_multiplier", 1.5), DAY//STEPS[frame], STOPS, TARGETS)
     digest = sha256(encode(inputs).encode()).hexdigest()[:16]
     return setup/f"hourly-forecasts-{digest}-{seed}.npy"
 
 
 def init_builder(setup, config, path, seed):
-    times, bars, _ = load_data(setup, config)["1h"]
+    frame, = config["datasets"]
+    times, bars, _ = load_data(setup, config)[frame]
     execution = Execution(**config["execution"])
     multiplier = config.get("evidence", {}).get("cost_multiplier", 1.5)
     stressed = replace(execution, fee_bps=min(9999, execution.fee_bps*multiplier),
                        slippage_bps=min(9999, execution.slippage_bps*multiplier))
     WORKER.update(times=times, bars=bars, output=np.load(path, mmap_mode="r+"),
-                  execution=(execution, stressed), seed=seed)
+                  execution=(execution, stressed), seed=seed, step=STEPS[frame])
 
 
 def fill_block(bounds):
     a, b = bounds
     times, bars = WORKER["times"], WORKER["bars"]
     for i in range(a, b):
-        sampled = forecast_paths(bars, times, i, 0, HORIZON, HOUR, True, WORKER["seed"])
+        step = WORKER["step"]
+        sampled = forecast_paths(bars, times, i, 0, DAY//step, step, True, WORKER["seed"])
         if sampled is None:
             WORKER["output"][i] = np.nan
             continue
@@ -69,7 +72,8 @@ def prepare_grid(setup, config, seed, workers):
     path = grid_path(setup, config, seed)
     if path.exists():
         return
-    count = config["datasets"]["1h"]["development_bars"]
+    frame, = config["datasets"]
+    count = config["datasets"][frame]["development_bars"]
     temporary = path.with_suffix(".tmp.npy")
     mapped = np.lib.format.open_memmap(temporary, mode="w+", dtype="float64",
                                        shape=(count, 2, len(STOPS), len(TARGETS), 4))

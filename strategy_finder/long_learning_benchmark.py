@@ -62,7 +62,7 @@ def evaluate_batch(ledger, pool, experiment, protocol, deadline, progress, halt)
     if len(pending) % 2:
         raise ValueError("Pending trials must contain complete pairs.")
     chunk_size = 60
-    if protocol.get("timeframe") == "1h":
+    if protocol.get("timeframe") in ("1h", "4h"):
         pairs = list(zip(pending[::2], pending[1::2]))
         pairs.sort(key=lambda pair: (pair[1][1]["stop_pct"], pair[1][1]["target_pct"]))
         pending = [candidate for pair in pairs for candidate in pair]
@@ -107,8 +107,8 @@ def pick_from_batch(ledger, experiment):
 def select_action(root, arm, history, protocol, deadline, allowed):
     number = len(history)
     seen = {e["proposal"]["indicator"] for e in history}
-    hourly = protocol.get("timeframe") == "1h"
-    if hourly and number <= 5:
+    intraday = protocol.get("timeframe") in ("1h", "4h")
+    if intraday and number <= 5:
         followup_families = {e["proposal"]["indicator"] for e in history[1:]}
         novel = [a for a in allowed if a.split(":")[0] not in followup_families]
         if novel:
@@ -120,6 +120,8 @@ def select_action(root, arm, history, protocol, deadline, allowed):
     prior = [{"experiment": e["experiment"], "choice": e["proposal"]["choice"]} for e in history]
     common = {"assets": protocol["current_assets"], "round": number, "allowed_actions": allowed,
               "prior_choices": prior}
+    if intraday:
+        common["timeframe"] = protocol["timeframe"]
     if arm == "random":
         rng = random.Random(protocol["seed"]+number)
         return {"choice": rng.choice(allowed), "parent": None,
@@ -127,7 +129,7 @@ def select_action(root, arm, history, protocol, deadline, allowed):
     evidence = [{"experiment": e["experiment"], "proposal": e["proposal"], "effects": e["matched"]}
                 for e in history]
     if arm == "programmatic":
-        if hourly:
+        if intraday:
             qualifying = [e for e in history if e["proposal"]["choice"] in allowed
                           and e["diversity"]["new_10"]]
             if qualifying:
@@ -139,8 +141,8 @@ def select_action(root, arm, history, protocol, deadline, allowed):
     prompt = ("Choose one eligible matched experiment. Both AI planners use the same local grids. "
               "Each action combines an entry family with one change, removing the signal exit or enabling Time Machine. "
               "State an observable expectation. Stay within the action menu.")
-    if hourly:
-        prompt += (" Data are hourly spot candles. Entry_confirmation adds a same-timeframe trend gate. "
+    if intraday:
+        prompt += (" Data are intraday spot candles. Entry_confirmation adds a same-timeframe trend gate. "
                    "Time_machine_20, _30 and _40 are minimum target-hit probabilities within 24 hours. "
                    "Trades can remain open beyond the forecast horizon. "
                    "Seek novel trading behavior and strategies clearing 10% annualized net return, "
@@ -153,7 +155,7 @@ def select_action(root, arm, history, protocol, deadline, allowed):
             entry["positive_windows"] = sum((w["median_net_return_delta"] or 0) > 0 for w in windows)
             entry["windows"] = len(windows)
         payload = {**common, "campaign_map": compact, "latest_experiment": evidence[-1]}
-        if hourly:
+        if intraday:
             payload["qualified_discoveries"] = [
                 {"choice": e["proposal"]["choice"], **e["diversity"]}
                 for e in history if "diversity" in e
@@ -177,7 +179,7 @@ def select_action(root, arm, history, protocol, deadline, allowed):
 def start_batch(root, arm, ledger, history, protocol, deadline):
     exhausted = set(ledger.get("exhausted_actions", []))
     timeframe = protocol.get("timeframe", "1d")
-    menu = HOURLY_OPTIONS if timeframe == "1h" else OPTIONS
+    menu = HOURLY_OPTIONS if timeframe in ("1h", "4h") else OPTIONS
     for _ in menu:
         allowed = [a for a in menu if a not in exhausted]
         if not allowed or time.time() >= deadline:
@@ -223,7 +225,7 @@ def settle_batch(ledger, history, experiment, protocol, clock, leader, total):
                   "backtests": total, "complete": status=="complete",
                   "elapsed_seconds": min(protocol["seconds"], max(0, time.time()-clock["start"]))}
     with ledger.db:
-        if protocol.get("timeframe") == "1h":
+        if protocol.get("timeframe") in ("1h", "4h"):
             item["diversity"] = hourly_benchmark.record_batch(ledger, experiment)
         ledger.db.execute("UPDATE experiments SET status=? WHERE id=?", (status, experiment))
         ledger.db.execute("INSERT INTO batch_checkpoints VALUES (?,?)", (experiment, encode(checkpoint)))
@@ -260,7 +262,7 @@ def run_arm(root, setup, arm, config, protocol, clock, halt):
         if time.time() < clock["start"]:
             time.sleep(max(0, clock["start"]-time.time()))
         if time.time() < deadline:
-            forecast_seed = protocol["seed"] if protocol.get("timeframe") == "1h" else None
+            forecast_seed = protocol["seed"] if protocol.get("timeframe") in ("1h", "4h") else None
             with ProcessPoolExecutor(max_workers=protocol["workers_per_arm"], initializer=setup_worker,
                                      initargs=(setup, config, forecast_seed)) as pool:
                 while not halt.is_set() and time.time() < deadline:
@@ -305,7 +307,7 @@ def run_arm(root, setup, arm, config, protocol, clock, halt):
         if not total:
             raise ValueError(f"{arm} finished without any follow-up pairs.")
         write_json(directory/"checkpoints.json", history)
-        shortlist = hourly_benchmark.freeze_shortlist(ledger) if protocol.get("timeframe") == "1h" else []
+        shortlist = hourly_benchmark.freeze_shortlist(ledger) if protocol.get("timeframe") in ("1h", "4h") else []
         write_json(directory/"endpoint.json", {"leader": leader, "backtests": total, "shortlist": shortlist,
                    "completed_batches": sum(x["complete"] for x in history), "finished": utc(time.time()),
                    "stop_reason": stop_reason})
@@ -325,7 +327,7 @@ def prepare_shared(setup, config, protocol):
             run_round(pool, setup, {"shared": ledger}, 0,
                       {"seed": protocol["seed"], "backtests_per_batch": protocol["batch"],
                        "timeframe": protocol.get("timeframe", "1d")}, history)
-            if protocol.get("timeframe") == "1h":
+            if protocol.get("timeframe") in ("1h", "4h"):
                 with ledger.db:
                     history["shared"][0]["diversity"] = hourly_benchmark.record_batch(ledger, 1)
                 write_json(directory/"rounds.json", history["shared"])
@@ -352,7 +354,7 @@ def discovery(root, setups, protocol):
             continue
         write_json(root/"status.json", {"phase": "shared_start", "market": config["assets"][0], "pid": os.getpid()})
         prepare_shared(setup, config, protocol)
-        if protocol.get("timeframe") == "1h":
+        if protocol.get("timeframe") in ("1h", "4h"):
             write_json(root/"status.json", {"phase": "forecast_grid", "market": config["assets"][0],
                                            "pid": os.getpid()})
             hourly_forecasts.prepare_grid(setup, config, protocol["seed"], min(os.cpu_count() or 1, 10))
@@ -396,16 +398,17 @@ def evaluate(root, setups, protocol):
                 cache[key], trades = assess(times, bars, signals(times, bars, strategy, {}), strategy, execution,
                                        config["drawdown"], protocol["seed"], final=True, warmup=warmup,
                                        policy=config.get("evidence"))
-                if timeframe == "1h":
+                if timeframe in ("1h", "4h"):
                     record_behavior(cache[key], trades)
             result = cache[key]
             rows.append({"market": config["assets"][0], "arm": arm, "pick": kind,
                          "backtests": count, "elapsed_seconds": elapsed, "complete_batch": complete,
                          "net_return": result["net_return"], "drawdown": result["max_drawdown"],
                          "qualified": result["outcome"]=="qualified", "candidate": key})
-            if timeframe == "1h":
+            if timeframe in ("1h", "4h"):
                 rows[-1].update({k: result[k] for k in ("annual_net_return", "sharpe", "trades",
-                                                       "win_rate", "median_holding_hours", "held_over_24h")})
+                                                       "win_rate", "costs", "turnover", "exposure",
+                                                       "median_holding_hours", "held_over_24h")})
                 rows[-1].update(qualified_10=hourly_benchmark.qualifies(result),
                                 qualified_15=hourly_benchmark.qualifies(result, .15),
                                 development={k: candidate["development"][k] for k in (
@@ -421,7 +424,7 @@ def evaluate(root, setups, protocol):
             add(arm, "endpoint", end["backtests"], protocol["seconds"], end["leader"], False)
             for candidate in end.get("shortlist", []):
                 add(arm, "shortlist", end["backtests"], None, candidate, True)
-    if protocol.get("timeframe") == "1h":
+    if protocol.get("timeframe") in ("1h", "4h"):
         hourly_benchmark.write_summary(root, setups, ARMS, read, rows)
     else:
         write_results(root, rows, protocol, setups)
@@ -528,7 +531,8 @@ def main():
     parser.add_argument("phase", choices=("discover", "evaluate", "run", "status"))
     parser.add_argument("root", type=Path)
     parser.add_argument("--markets", nargs="+")
-    parser.add_argument("--timeframe", choices=("1d", "1h"), default="1d")
+    parser.add_argument("--timeframe", choices=("1d", "1h", "4h"), default="1d")
+    parser.add_argument("--allocation", type=float, default=.1, help="Required fixed fraction of cash per entry.")
     parser.add_argument("--watch", action="store_true", help="Refresh the status display every 30 seconds.")
     parser.add_argument("--seconds", type=int, default=28800)
     parser.add_argument("--batch", type=int, default=10000)
@@ -553,8 +557,8 @@ def main():
         if config["split"] < previous_end:
             raise ValueError("Market holdouts must be non-overlapping and ordered by date.")
         previous_end = config["datasets"][args.timeframe]["last_bar"]+STEPS[args.timeframe]
-        if not config["execution"].get("fixed_allocation") or config["execution"]["allocation"] != .1:
-            raise ValueError("Every setup must use fixed 10% entry allocation.")
+        if not config["execution"].get("fixed_allocation") or config["execution"]["allocation"] != args.allocation:
+            raise ValueError(f"Every setup must use fixed {args.allocation:.0%} entry allocation.")
     protocol = {"markets": {p.name: {"assets": c["assets"], "split": c["split"], "datasets": c["datasets"],
                                    "execution": c["execution"], "evidence": c.get("evidence"),
                                    "drawdown": c["drawdown"]} for p,c in setups},
