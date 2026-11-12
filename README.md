@@ -131,8 +131,9 @@ python -m strategy_finder.long_learning_benchmark status runs/long-learning-benc
 Discovery saves the cumulative leader and the latest batch leader in each
 arm's SQLite ledger. The runner evaluates the sealed holdouts automatically
 after all markets finish and writes `summary.md`, `checkpoint-results.csv`,
-and `equal-trial-results.csv`. On Windows, double-click
-`Watch Learning Benchmark.bat` to see progress for that directory.
+and `equal-trial-results.csv`. On Windows, run
+`"Watch Learning Benchmark.bat" -Run runs/long-learning-benchmark`
+to monitor that directory.
 
 To run a small hourly comparison on one prepared market:
 
@@ -147,3 +148,5 @@ holdout. The hourly report counts distinct trade histories and tracks new
 qualifiers at 10% and 15% annualized net return, below 30% drawdown and above
 0.8 Sharpe. Its Time Machine actions use a 24-hour forecast at 20%, 30%, or
 40% target-hit probability. The holding limit remains optional.
+Double-click `Watch Learning Benchmark.bat` to monitor the
+`runs/hourly-learning-20` run.
