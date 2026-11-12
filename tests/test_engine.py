@@ -152,6 +152,24 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(result["open_position"]["leg"], 1)
         self.assertEqual(result["open_position"]["entry_timestamp"], times[4])
 
+    def test_early_exit_fills_at_next_open_without_reentry(self):
+        times = np.arange(5)*HOUR
+        bars = np.full((5, 1, 5), 100.)
+        bars[2, 0, :4] = [103, 120, 90, 103]
+        strategy = Strategy("1h", Rule("return", 2, .1, None, "above"),
+                            stop_pct=.05, target_pct=.10, exit_policy="bracket")
+        execution = Execution(fee_bps=0, slippage_bps=0)
+        signal = [0, 0, -2, -2, -2]
+        base = simulate(times, bars, signal, strategy, execution, 0, 5)
+        early = simulate(times, bars, signal, strategy, execution, 0, 5,
+                         early_exit=lambda index, leg, entry_index, price: index == 2)
+        stopped, = base["trades"]
+        sold, = early["trades"]
+        self.assertEqual(stopped["reason"], "stop")
+        self.assertEqual((sold["entry_timestamp"], sold["exit_timestamp"]), (times[1], times[2]))
+        self.assertEqual((sold["reason"], sold["exit"], early["open_position"]),
+                         ("forecast_exit", 103, None))
+
     def test_proposed_bracket_has_no_signal_exit_and_keeps_time_machine_control(self):
         proposal = dict(offline(0, ["4h"]), exit_policies=["bracket"], exits=[],
                         lookbacks=[8], entries=[-1], stops=[.05], targets=[.1],

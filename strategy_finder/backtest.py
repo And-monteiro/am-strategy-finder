@@ -84,7 +84,7 @@ def time_machine(bars, times, i, leg, strategy, execution, seed, paths=192):
 
 
 def simulate(times, bars, signal, strategy, execution, start, stop, seed=19, tm_cache=None, deadline=None,
-             forecast_lookup=None, entry_filter=None):
+             forecast_lookup=None, entry_filter=None, early_exit=None):
     import time
 
     cash = execution.capital
@@ -122,7 +122,7 @@ def simulate(times, bars, signal, strategy, execution, start, stop, seed=19, tm_
         elif strategy.target_pct and high >= ceiling:
             close(index, ceiling, "target")
 
-    hourly = step == STEPS["1h"] and stop-start >= 256
+    hourly = step == STEPS["1h"] and stop-start >= 256 and early_exit is None
     if hourly:
         desired_by_bar = np.full(stop-start, -2, dtype=int)
         desired_by_bar[1:] = np.where(np.diff(times[start:stop]) == step, signal[start:stop-1], -2)
@@ -165,7 +165,11 @@ def simulate(times, bars, signal, strategy, execution, start, stop, seed=19, tm_
         signal_exit = strategy.exit_policy == "signal" and leg >= 0 and desired not in (-2, leg)
         if expired or signal_exit:
             close(i, bars[i, leg, 0], "timeout" if expired else "signal")
-        if (leg < 0 and desired >= 0 and not expired
+        exited_early = (early_exit is not None and leg >= 0 and i > 0
+                        and times[i]-times[i-1] == step and early_exit(i, leg, entry_i, entry_price))
+        if exited_early:
+            close(i, bars[i, leg, 0], "forecast_exit")
+        if (leg < 0 and desired >= 0 and not expired and not exited_early
                 and (entry_filter is None or entry_filter(i, desired))):
             permitted = True
             forecast = None
