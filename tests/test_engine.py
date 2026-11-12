@@ -8,6 +8,7 @@ import numpy as np
 
 from strategy_finder.backtest import Execution, forecast_paths, metrics, simulate, time_machine
 from strategy_finder.data import DAY, HOUR, Candle, align, load_snapshot, save_snapshot
+from strategy_finder.designer_benchmark import candidates as designer_candidates, strategy_for
 from strategy_finder.feedback import rich_context, validate_action
 from strategy_finder.hourly_forecasts import summarize_grid
 from strategy_finder.matched_planner_test import choose_program, recipe
@@ -17,6 +18,20 @@ from strategy_finder.strategy import Rule, Strategy, pine, signals
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_designer_warmup_covers_families_and_matches_tool_controls(self):
+        seen = set()
+        first = designer_candidates(1, 100, 19, seen)
+        second = designer_candidates(2, 100, 20, seen)
+        self.assertEqual(len(seen), 200)
+        self.assertEqual(len({(s["design"]["family"], s["design"]["policy"]) for _, s in first}), 10)
+        for _, spec in first+second:
+            self.assertEqual(strategy_for(spec).timeframe, "4h")
+        for (_, control), (_, treatment) in zip(second[::2], second[1::2]):
+            self.assertEqual(control["design"]["family"], treatment["design"]["family"])
+            for parameter, value in control["parameters"].items():
+                self.assertEqual(treatment["parameters"][parameter], value)
+            self.assertNotEqual(control["design"], treatment["design"])
+
     def test_programmatic_planner_uses_paired_window_evidence(self):
         def experiment(number, choice, deltas, full_delta):
             return {"experiment": number, "proposal": {"choice": choice}, "effects": {

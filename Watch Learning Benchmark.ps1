@@ -1,5 +1,5 @@
 param(
-    [string]$Run = 'runs/4h-full-allocation',
+    [string]$Run = 'runs/designer-comparison',
     [switch]$Once
 )
 

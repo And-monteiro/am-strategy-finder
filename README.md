@@ -152,6 +152,18 @@ qualifiers at 10% and 15% annualized net return, below 30% drawdown and above
 For the 4h spot comparison, prepare with `--timeframes 4h --fixed-allocation 1`
 and run with `--timeframe 4h --allocation 1 --batch 5000 --max-batches 20`.
 The Time Machine forecast still spans 24 hours.
-Double-click `Watch Learning Benchmark.bat` to monitor the
-`runs/4h-full-allocation` run. Pass `-Run runs/hourly-learning-20` to open
-the earlier hourly run.
+Pass `-Run runs/4h-full-allocation` or `-Run runs/hourly-learning-20`
+to the Windows monitor to open an earlier run.
+
+The strategy designer benchmark compares Luna and the programmatic designer
+after two shared warm-up batches. Prepare single-asset 4h snapshots with
+`--fixed-allocation 1`, then run:
+
+```text
+python -m strategy_finder.designer_benchmark runs/designer-comparison --markets ETH SOL --batch 5000 --batches 20
+```
+
+Double-click `Watch Learning Benchmark.bat` to monitor this run. Each arm
+records its batch decisions, parameter frequencies, performance distributions,
+and distinct trade histories. Both arms on all markets freeze equally sized
+shortlists before the runner reads any holdout.
