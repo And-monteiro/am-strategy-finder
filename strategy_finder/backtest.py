@@ -84,7 +84,7 @@ def time_machine(bars, times, i, leg, strategy, execution, seed, paths=192):
 
 
 def simulate(times, bars, signal, strategy, execution, start, stop, seed=19, tm_cache=None, deadline=None,
-             forecast_lookup=None):
+             forecast_lookup=None, entry_filter=None):
     import time
 
     cash = execution.capital
@@ -165,7 +165,8 @@ def simulate(times, bars, signal, strategy, execution, start, stop, seed=19, tm_
         signal_exit = strategy.exit_policy == "signal" and leg >= 0 and desired not in (-2, leg)
         if expired or signal_exit:
             close(i, bars[i, leg, 0], "timeout" if expired else "signal")
-        if leg < 0 and desired >= 0 and not expired:
+        if (leg < 0 and desired >= 0 and not expired
+                and (entry_filter is None or entry_filter(i, desired))):
             permitted = True
             forecast = None
             if strategy.time_machine:
