@@ -136,8 +136,8 @@ def matched_variants(proposal, count, seed, frames, rotation=False):
     if count < 2 or count % 2:
         raise ValueError("Matched experiments need a positive even backtest budget.")
     change = proposal.get("matched_change")
-    if change not in ("exit_policy", "time_machine"):
-        raise ValueError("Matched change must be exit_policy or time_machine.")
+    if change not in ("exit_policy", "time_machine", "entry_confirmation"):
+        raise ValueError("Unsupported matched change.")
     base = dict(proposal, time_machine_thresholds=[0])
     for field in ("stops", "targets"):
         base[field] = [v for v in proposal[field] if v > 0]
@@ -145,12 +145,15 @@ def matched_variants(proposal, count, seed, frames, rotation=False):
         base["exit_policies"] = ["signal"]
         if not rotation and len(base["exits"]) != 1:
             raise ValueError("Use exactly one signal exit threshold for a single-asset exit comparison.")
-    else:
+    elif change == "time_machine":
         policies = proposal.get("exit_policies", [])
         thresholds = proposal["time_machine_thresholds"]
         if len(policies) != 1 or len(thresholds) != 1 or not 0 < thresholds[0] < 1:
             raise ValueError("Time Machine comparisons need one exit policy and one positive threshold.")
-        base["holding_periods"] = [n for n in proposal["holding_periods"] if 1 <= n <= 48]
+        if not proposal.get("forecast_bars"):
+            base["holding_periods"] = [n for n in proposal["holding_periods"] if 1 <= n <= 48]
+    else:
+        base["filter_rule"] = None
     controls = variants(base, count//2, seed, frames, rotation)
     result = []
     for raw in controls:
@@ -158,8 +161,11 @@ def matched_variants(proposal, count, seed, frames, rotation=False):
         if change == "exit_policy":
             rule = control.rule if rotation else replace(control.rule, exit=None)
             treatment = replace(control, exit_policy="bracket", rule=rule)
+        elif change == "time_machine":
+            treatment = replace(control, time_machine=proposal["time_machine_thresholds"][0],
+                                forecast_bars=proposal.get("forecast_bars", 0))
         else:
-            treatment = replace(control, time_machine=proposal["time_machine_thresholds"][0])
+            treatment = replace(control, filter_rule=Rule(**proposal["filter_rule"]))
         result.extend([raw, treatment.to_dict()])
     return result
 
@@ -191,9 +197,11 @@ def windows(times, step, final):
 
 
 def assess(times, bars, signal, strategy, execution, cap, seed, final=False,
-           warmup=0, tm_cache=None, deadline=None, policy=None, all_periods=False):
+           warmup=0, tm_cache=None, deadline=None, policy=None, all_periods=False,
+           forecast_lookup=None, stress_forecast_lookup=None):
     step = STEPS[strategy.timeframe]
-    whole = simulate(times, bars, signal, strategy, execution, warmup, len(times), seed, tm_cache, deadline)
+    whole = simulate(times, bars, signal, strategy, execution, warmup, len(times), seed, tm_cache, deadline,
+                     forecast_lookup)
     active = times[warmup:]
     result = metrics(active, whole, execution.capital, step)
     result["buy_and_hold"] = [float(bars[-1, leg, 3] / bars[warmup, leg, 0] - 1)
@@ -214,7 +222,8 @@ def assess(times, bars, signal, strategy, execution, cap, seed, final=False,
     if all(stages) or all_periods:
         for a, b in windows(active, step, final):
             a, b = a+warmup, b+warmup
-            values = simulate(times, bars, signal, strategy, execution, a, b, seed, tm_cache, deadline)
+            values = simulate(times, bars, signal, strategy, execution, a, b, seed, tm_cache, deadline,
+                              forecast_lookup)
             measured = metrics(times[a:b], values, execution.capital, step)
             result["periods"].append({"start": int(times[a]), "end": int(times[b-1]+step),
                                       "return": measured["net_return"], "trades": measured["trades"]})
@@ -222,7 +231,8 @@ def assess(times, bars, signal, strategy, execution, cap, seed, final=False,
         multiplier = policy.get("cost_multiplier", 1.5)
         stressed = replace(execution, fee_bps=min(9999, execution.fee_bps*multiplier),
                            slippage_bps=min(9999, execution.slippage_bps*multiplier))
-        cost_test = simulate(times, bars, signal, strategy, stressed, warmup, len(times), seed, deadline=deadline)
+        cost_test = simulate(times, bars, signal, strategy, stressed, warmup, len(times), seed,
+                             deadline=deadline, forecast_lookup=stress_forecast_lookup)
         result["stress_return"] = cost_test["equity"][-1] / execution.capital - 1
         evidence &= result["stress_return"] > 0
     positive = sum(p["return"] > 0 for p in result["periods"])

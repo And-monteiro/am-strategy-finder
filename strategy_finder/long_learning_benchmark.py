@@ -21,9 +21,11 @@ from . import planner
 from .backtest import Execution
 from .cli import lock
 from .feedback import campaign_map, development_score
+from . import hourly_benchmark, hourly_forecasts
+from .data import STEPS
 from .learning_benchmark import APIUnavailable, BudgetExhausted, budgeted_response
-from .matched_planner_test import (OPTIONS, choose_program, evaluate_chunk, freeze, identity,
-                                   make_choices, recipe, run_round, setup_worker)
+from .matched_planner_test import (HOURLY_OPTIONS, OPTIONS, choose_program, evaluate_chunk, freeze,
+                                   identity, make_choices, recipe, record_behavior, run_round, setup_worker)
 from .research import Ledger, assess, encode, experiment_report, load_data, write_json
 from .strategy import Strategy, signals
 from .windows_launcher import load_openai_settings
@@ -59,7 +61,13 @@ def evaluate_batch(ledger, pool, experiment, protocol, deadline, progress, halt)
         (experiment,))]
     if len(pending) % 2:
         raise ValueError("Pending trials must contain complete pairs.")
-    chunks = iter(pending[i:i+60] for i in range(0, len(pending), 60))
+    chunk_size = 60
+    if protocol.get("timeframe") == "1h":
+        pairs = list(zip(pending[::2], pending[1::2]))
+        pairs.sort(key=lambda pair: (pair[1][1]["stop_pct"], pair[1][1]["target_pct"]))
+        pending = [candidate for pair in pairs for candidate in pair]
+        chunk_size = 12
+    chunks = iter(pending[i:i+chunk_size] for i in range(0, len(pending), chunk_size))
     futures = set()
     completed = 0
 
@@ -99,7 +107,13 @@ def pick_from_batch(ledger, experiment):
 def select_action(root, arm, history, protocol, deadline, allowed):
     number = len(history)
     seen = {e["proposal"]["indicator"] for e in history}
-    if number % 4 == 3:
+    hourly = protocol.get("timeframe") == "1h"
+    if hourly and number <= 5:
+        followup_families = {e["proposal"]["indicator"] for e in history[1:]}
+        novel = [a for a in allowed if a.split(":")[0] not in followup_families]
+        if novel:
+            allowed = novel
+    elif number % 4 == 3:
         novel = [a for a in allowed if a.split(":")[0] not in seen]
         if novel:
             allowed = novel
@@ -113,10 +127,24 @@ def select_action(root, arm, history, protocol, deadline, allowed):
     evidence = [{"experiment": e["experiment"], "proposal": e["proposal"], "effects": e["matched"]}
                 for e in history]
     if arm == "programmatic":
+        if hourly:
+            qualifying = [e for e in history if e["proposal"]["choice"] in allowed
+                          and e["diversity"]["new_10"]]
+            if qualifying:
+                best = max(qualifying, key=lambda e: (e["diversity"]["new_10"], e["diversity"]["new_15"]))
+                return {"choice": best["proposal"]["choice"], "parent": best["experiment"],
+                        "reason": "Repeat the design with the most new qualifying trade histories.",
+                        "expectation": "Fresh settings produce additional qualifying histories."}, {"model": "programmatic"}
         return choose_program({"experiments": evidence}, allowed), {"model": "programmatic"}
     prompt = ("Choose one eligible matched experiment. Both AI planners use the same local grids. "
               "Each action combines an entry family with one change, removing the signal exit or enabling Time Machine. "
               "State an observable expectation. Stay within the action menu.")
+    if hourly:
+        prompt += (" Data are hourly spot candles. Entry_confirmation adds a same-timeframe trend gate. "
+                   "Time_machine_20, _30 and _40 are minimum target-hit probabilities within 24 hours. "
+                   "Trades can remain open beyond the forecast horizon. "
+                   "Seek novel trading behavior and strategies clearing 10% annualized net return, "
+                   "30% drawdown and 0.8 Sharpe. Use evidence of qualified discoveries when provided.")
     payload = common
     if arm == "luna_feedback":
         compact = campaign_map(history)
@@ -125,6 +153,11 @@ def select_action(root, arm, history, protocol, deadline, allowed):
             entry["positive_windows"] = sum((w["median_net_return_delta"] or 0) > 0 for w in windows)
             entry["windows"] = len(windows)
         payload = {**common, "campaign_map": compact, "latest_experiment": evidence[-1]}
+        if hourly:
+            payload["qualified_discoveries"] = [
+                {"choice": e["proposal"]["choice"], **e["diversity"]}
+                for e in history if "diversity" in e
+            ]
         prompt += (" Use paired development evidence. Name a parent when refining. "
                    "Consider drawdown and cross-window stability.")
     else:
@@ -143,12 +176,14 @@ def select_action(root, arm, history, protocol, deadline, allowed):
 
 def start_batch(root, arm, ledger, history, protocol, deadline):
     exhausted = set(ledger.get("exhausted_actions", []))
-    for _ in OPTIONS:
-        allowed = [a for a in OPTIONS if a not in exhausted]
+    timeframe = protocol.get("timeframe", "1d")
+    menu = HOURLY_OPTIONS if timeframe == "1h" else OPTIONS
+    for _ in menu:
+        allowed = [a for a in menu if a not in exhausted]
         if not allowed or time.time() >= deadline:
             return None
         decision, provider = select_action(root, arm, history, protocol, deadline, allowed)
-        spec = recipe(decision["choice"], decision["parent"], decision["reason"], decision["expectation"])
+        spec = recipe(decision["choice"], decision["parent"], decision["reason"], decision["expectation"], timeframe)
         if time.time() >= deadline:
             return None
         try:
@@ -188,6 +223,8 @@ def settle_batch(ledger, history, experiment, protocol, clock, leader, total):
                   "backtests": total, "complete": status=="complete",
                   "elapsed_seconds": min(protocol["seconds"], max(0, time.time()-clock["start"]))}
     with ledger.db:
+        if protocol.get("timeframe") == "1h":
+            item["diversity"] = hourly_benchmark.record_batch(ledger, experiment)
         ledger.db.execute("UPDATE experiments SET status=? WHERE id=?", (status, experiment))
         ledger.db.execute("INSERT INTO batch_checkpoints VALUES (?,?)", (experiment, encode(checkpoint)))
     history.append(checkpoint)
@@ -223,8 +260,9 @@ def run_arm(root, setup, arm, config, protocol, clock, halt):
         if time.time() < clock["start"]:
             time.sleep(max(0, clock["start"]-time.time()))
         if time.time() < deadline:
+            forecast_seed = protocol["seed"] if protocol.get("timeframe") == "1h" else None
             with ProcessPoolExecutor(max_workers=protocol["workers_per_arm"], initializer=setup_worker,
-                                     initargs=(setup, config)) as pool:
+                                     initargs=(setup, config, forecast_seed)) as pool:
                 while not halt.is_set() and time.time() < deadline:
                     if protocol["max_batches"] and len(history) >= protocol["max_batches"]:
                         stop_reason = "batch_cap"
@@ -267,7 +305,8 @@ def run_arm(root, setup, arm, config, protocol, clock, halt):
         if not total:
             raise ValueError(f"{arm} finished without any follow-up pairs.")
         write_json(directory/"checkpoints.json", history)
-        write_json(directory/"endpoint.json", {"leader": leader, "backtests": total,
+        shortlist = hourly_benchmark.freeze_shortlist(ledger) if protocol.get("timeframe") == "1h" else []
+        write_json(directory/"endpoint.json", {"leader": leader, "backtests": total, "shortlist": shortlist,
                    "completed_batches": sum(x["complete"] for x in history), "finished": utc(time.time()),
                    "stop_reason": stop_reason})
         progress(force=True)
@@ -284,7 +323,12 @@ def prepare_shared(setup, config, protocol):
                        initializer=setup_worker, initargs=(setup, config)) as pool:
             history = {"shared": read(directory/"rounds.json", [])}
             run_round(pool, setup, {"shared": ledger}, 0,
-                      {"seed": protocol["seed"], "backtests_per_batch": protocol["batch"]}, history)
+                      {"seed": protocol["seed"], "backtests_per_batch": protocol["batch"],
+                       "timeframe": protocol.get("timeframe", "1d")}, history)
+            if protocol.get("timeframe") == "1h":
+                with ledger.db:
+                    history["shared"][0]["diversity"] = hourly_benchmark.record_batch(ledger, 1)
+                write_json(directory/"rounds.json", history["shared"])
             write_json(directory/"leader.json", freeze(ledger, 0))
     for arm in ARMS:
         target = setup/arm
@@ -308,6 +352,10 @@ def discovery(root, setups, protocol):
             continue
         write_json(root/"status.json", {"phase": "shared_start", "market": config["assets"][0], "pid": os.getpid()})
         prepare_shared(setup, config, protocol)
+        if protocol.get("timeframe") == "1h":
+            write_json(root/"status.json", {"phase": "forecast_grid", "market": config["assets"][0],
+                                           "pid": os.getpid()})
+            hourly_forecasts.prepare_grid(setup, config, protocol["seed"], min(os.cpu_count() or 1, 10))
         clock_path = setup/"clock.json"
         clock = read(clock_path)
         if not clock:
@@ -336,7 +384,8 @@ def evaluate(root, setups, protocol):
     write_json(root/"status.json", {"phase": "evaluation", "pid": os.getpid()})
     rows = []
     for setup, config in setups:
-        times, bars, warmup = load_data(setup, config, final=True)["1d"]
+        timeframe = protocol.get("timeframe", "1d")
+        times, bars, warmup = load_data(setup, config, final=True)[timeframe]
         execution = Execution(**config["execution"])
         cache = {}
 
@@ -344,14 +393,24 @@ def evaluate(root, setups, protocol):
             key = identity(candidate["strategy"])
             if key not in cache:
                 strategy = Strategy.from_dict(candidate["strategy"])
-                cache[key], _ = assess(times, bars, signals(times, bars, strategy, {}), strategy, execution,
+                cache[key], trades = assess(times, bars, signals(times, bars, strategy, {}), strategy, execution,
                                        config["drawdown"], protocol["seed"], final=True, warmup=warmup,
                                        policy=config.get("evidence"))
+                if timeframe == "1h":
+                    record_behavior(cache[key], trades)
             result = cache[key]
             rows.append({"market": config["assets"][0], "arm": arm, "pick": kind,
                          "backtests": count, "elapsed_seconds": elapsed, "complete_batch": complete,
                          "net_return": result["net_return"], "drawdown": result["max_drawdown"],
                          "qualified": result["outcome"]=="qualified", "candidate": key})
+            if timeframe == "1h":
+                rows[-1].update({k: result[k] for k in ("annual_net_return", "sharpe", "trades",
+                                                       "win_rate", "median_holding_hours", "held_over_24h")})
+                rows[-1].update(qualified_10=hourly_benchmark.qualifies(result),
+                                qualified_15=hourly_benchmark.qualifies(result, .15),
+                                development={k: candidate["development"][k] for k in (
+                                    "annual_net_return", "max_drawdown", "sharpe", "trades",
+                                    "median_holding_hours", "held_over_24h")})
 
         add("shared", "shared", 0, 0, read(setup/"shared"/"leader.json"), True)
         for arm in ARMS:
@@ -360,7 +419,12 @@ def evaluate(root, setups, protocol):
                     add(arm, label, batch["backtests"], batch["elapsed_seconds"], batch[label], batch["complete"])
             end = read(setup/arm/"endpoint.json")
             add(arm, "endpoint", end["backtests"], protocol["seconds"], end["leader"], False)
-    write_results(root, rows, protocol, setups)
+            for candidate in end.get("shortlist", []):
+                add(arm, "shortlist", end["backtests"], None, candidate, True)
+    if protocol.get("timeframe") == "1h":
+        hourly_benchmark.write_summary(root, setups, ARMS, read, rows)
+    else:
+        write_results(root, rows, protocol, setups)
     write_json(root/"status.json", {"phase": "complete", "report": "summary.md", "finished": utc(time.time())})
 
 
@@ -464,6 +528,7 @@ def main():
     parser.add_argument("phase", choices=("discover", "evaluate", "run", "status"))
     parser.add_argument("root", type=Path)
     parser.add_argument("--markets", nargs="+")
+    parser.add_argument("--timeframe", choices=("1d", "1h"), default="1d")
     parser.add_argument("--watch", action="store_true", help="Refresh the status display every 30 seconds.")
     parser.add_argument("--seconds", type=int, default=28800)
     parser.add_argument("--batch", type=int, default=10000)
@@ -483,11 +548,11 @@ def main():
     setups = [(root/m, read(root/m/"config.json")) for m in args.markets]
     previous_end = 0
     for setup, config in setups:
-        if not config or list(config["datasets"]) != ["1d"] or len(config["assets"]) != 1:
-            raise ValueError(f"{setup} needs a prepared single-asset daily snapshot.")
+        if not config or list(config["datasets"]) != [args.timeframe] or len(config["assets"]) != 1:
+            raise ValueError(f"{setup} needs a prepared single-asset {args.timeframe} snapshot.")
         if config["split"] < previous_end:
             raise ValueError("Market holdouts must be non-overlapping and ordered by date.")
-        previous_end = config["datasets"]["1d"]["last_bar"]+86400
+        previous_end = config["datasets"][args.timeframe]["last_bar"]+STEPS[args.timeframe]
         if not config["execution"].get("fixed_allocation") or config["execution"]["allocation"] != .1:
             raise ValueError("Every setup must use fixed 10% entry allocation.")
     protocol = {"markets": {p.name: {"assets": c["assets"], "split": c["split"], "datasets": c["datasets"],
@@ -496,6 +561,8 @@ def main():
                 "market_order": args.markets, "arms": ARMS, "seconds": args.seconds, "batch": args.batch,
                 "workers_per_arm": args.workers_per_arm, "max_batches": args.max_batches, "seed": 19,
                 "model": "gpt-6-luna", "max_api_usd": args.max_api_usd, "criterion": CRITERION}
+    if args.timeframe != "1d":
+        protocol["timeframe"] = args.timeframe
     protocol = json.loads(encode(protocol))
     with lock(root):
         path = root/"protocol.json"

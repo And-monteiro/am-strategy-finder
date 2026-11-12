@@ -2,13 +2,15 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
-from strategy_finder.backtest import Execution, metrics, simulate, time_machine
+from strategy_finder.backtest import Execution, forecast_paths, metrics, simulate, time_machine
 from strategy_finder.data import DAY, HOUR, Candle, align, load_snapshot, save_snapshot
 from strategy_finder.feedback import rich_context, validate_action
-from strategy_finder.matched_planner_test import choose_program
+from strategy_finder.hourly_forecasts import summarize_grid
+from strategy_finder.matched_planner_test import choose_program, recipe
 from strategy_finder.research import assess, matched_variants, variants
 from strategy_finder.planner import matched_offline, offline
 from strategy_finder.strategy import Rule, Strategy, pine, signals
@@ -55,6 +57,46 @@ class EvaluationTests(unittest.TestCase):
             outcome = simulate(times, bars, [0, -2, -2], strategy, execution, 0, 3)
             self.assertAlmostEqual(outcome["open_position"]["basis"], 100)
         self.assertAlmostEqual(Execution(allocation=.1).allocation_for_stop(.20), .025)
+
+    def test_hourly_time_machine_forecast_does_not_expire_trade(self):
+        proposal = recipe("zscore:time_machine_30", timeframe="1h")
+        proposal["holding_periods"] = [0]
+        control, treatment = map(Strategy.from_dict, matched_variants(proposal, 2, 19, ["1h"]))
+        self.assertEqual(treatment, replace(control, time_machine=.30, forecast_bars=24))
+        times = np.arange(32)*HOUR
+        bars = np.full((32, 1, 5), 100.)
+        bars[-1, 0, 1] = 120.
+        signal = [0]+[-2]*31
+        with patch("strategy_finder.backtest.time_machine", return_value=(.5, .2, .3, .01)):
+            trade, = simulate(times, bars, signal, treatment, Execution(), 0, len(times))["trades"]
+        self.assertEqual(trade["reason"], "target")
+        self.assertGreater(trade["exit_timestamp"]-trade["entry_timestamp"], 24*HOUR)
+
+    def test_hourly_confirmation_pair_changes_only_entry_filter(self):
+        proposal = recipe("return:entry_confirmation", timeframe="1h")
+        control, treatment = map(Strategy.from_dict, matched_variants(proposal, 2, 19, ["1h"]))
+        self.assertIsNone(control.filter_rule)
+        self.assertEqual(treatment, replace(control, filter_rule=Rule(**proposal["filter_rule"])))
+
+    def test_hourly_forecast_grid_matches_direct_forecasts(self):
+        times = np.arange(100)*HOUR
+        close = 100+2*np.sin(np.arange(100))
+        bars = np.repeat(close[:, None, None], 5, axis=2)
+        bars[:, 0, 1] *= 1.01
+        bars[:, 0, 2] *= .99
+        i, seed = 99, 19
+        prices, _ = forecast_paths(bars, times, i, 0, 24, HOUR, True, seed)
+        proposal = recipe("return:time_machine_30", timeframe="1h")
+        stops, targets = proposal["stops"][::7], proposal["targets"][::7]
+        for execution in (Execution(), Execution(fee_bps=15, slippage_bps=7.5)):
+            grid = summarize_grid(prices, execution, stops, targets)
+            for a, stop in enumerate(stops):
+                for b, target in enumerate(targets):
+                    strategy = Strategy("1h", Rule("return", 10, .01, None, "above"), stop_pct=stop,
+                                        target_pct=target, time_machine=.30, exit_policy="bracket",
+                                        forecast_bars=24)
+                    np.testing.assert_array_equal(
+                        grid[a, b], time_machine(bars, times, i, 0, strategy, execution, seed))
 
     def test_rich_feedback_keeps_older_winner_and_excludes_holdout(self):
         good = Strategy("1d", Rule("return", 3, .1, 0, "above")).to_dict()

@@ -15,6 +15,7 @@ from pathlib import Path
 from . import planner
 from .backtest import Execution
 from .feedback import campaign_map, development_score
+from .hourly_forecasts import HORIZON, STOPS, TARGETS, load_lookup
 from .learning_benchmark import budgeted_response
 from .research import Ledger, assess, encode, experiment_report, load_data, matched_variants, write_json
 from .strategy import Strategy, signals
@@ -29,6 +30,9 @@ FAMILIES = {
 }
 CHANGES = ("exit_policy", "time_machine")
 OPTIONS = tuple(f"{family}:{change}" for family in FAMILIES for change in CHANGES)
+HOURLY_OPTIONS = tuple(f"{family}:{change}" for family in FAMILIES
+                       for change in ("exit_policy", "entry_confirmation", "time_machine_20",
+                                      "time_machine_30", "time_machine_40"))
 BRANCHES = ("programmatic", "luna")
 _WORKER = {}
 
@@ -37,25 +41,41 @@ def identity(spec):
     return hashlib.sha256(encode(spec).encode()).hexdigest()
 
 
-def recipe(action, parent=None, reason=None, expectation=None):
+def recipe(action, parent=None, reason=None, expectation=None, timeframe="1d"):
     family, change = action.split(":")
     direction, entries, opposing = FAMILIES[family]
-    tm = change == "time_machine"
-    return {
+    tm = change.startswith("time_machine")
+    spec = {
         "hypothesis": reason or f"Compare {change} within the {family} entry family.",
         "expected_change": expectation, "parent": parent, "choice": action,
-        "matched_change": change, "timeframe": "1d", "indicator": family,
+        "matched_change": "time_machine" if tm else change, "timeframe": timeframe, "indicator": family,
         "direction": direction, "lookbacks": list(range(10, 126, 5)), "entries": entries,
-        "exits": [] if tm else [opposing], "holding_periods": [5, 8, 12, 16, 20, 25] if tm else [0, 5, 10, 15, 20, 30, 45],
+        "exits": [] if tm or change == "entry_confirmation" else [opposing],
+        "holding_periods": [5, 8, 12, 16, 20, 25] if tm else [0, 5, 10, 15, 20, 30, 45],
         "stops": [x/100 for x in range(2, 16)], "targets": [x/100 for x in range(4, 37, 2)],
-        "exit_policies": ["bracket"] if tm else ["signal", "bracket"],
+        "exit_policies": ["signal", "bracket"] if change == "exit_policy" else ["bracket"],
         "time_machine_thresholds": [.20] if tm else [0], "filter_rule": None,
     }
+    if timeframe == "1h":
+        scale = 1 if family == "zscore" else .25
+        spec.update(entries=[x*scale for x in entries], exits=[x*scale for x in spec["exits"]],
+                    holding_periods=[0, 12, 24, 48, 96, 168],
+                    stops=list(STOPS), targets=list(TARGETS))
+        if tm:
+            spec.update(forecast_bars=HORIZON, time_machine_thresholds=[int(change.split("_")[-1])/100])
+        if change == "entry_confirmation":
+            indicator = "sma_distance" if family != "sma_distance" else "return"
+            spec["filter_rule"] = {"indicator": indicator, "lookback": 48, "entry": 0,
+                                   "exit": None, "direction": "above"}
+    return spec
 
 
-def setup_worker(root, config):
+def setup_worker(root, config, forecast_seed=None):
     _WORKER.update(data=load_data(root, config), execution=Execution(**config["execution"]),
                    features={}, forecasts={}, cap=config["drawdown"], evidence=config.get("evidence"))
+    if forecast_seed is not None:
+        _WORKER.update(forecast_lookup=load_lookup(root, config, forecast_seed),
+                       stress_forecast_lookup=load_lookup(root, config, forecast_seed, stressed=True))
 
 
 def evaluate_chunk(chunk, seed):
@@ -65,16 +85,35 @@ def evaluate_chunk(chunk, seed):
         strategy = Strategy.from_dict(spec)
         times, bars, _ = _WORKER["data"][strategy.timeframe]
         signal = signals(times, bars, strategy, _WORKER["features"])
-        metrics, _ = assess(times, bars, signal, strategy, _WORKER["execution"], _WORKER["cap"], seed,
-                            tm_cache=_WORKER["forecasts"], policy=_WORKER["evidence"], all_periods=True)
+        metrics, result = assess(times, bars, signal, strategy, _WORKER["execution"], _WORKER["cap"], seed,
+                            tm_cache=_WORKER["forecasts"], policy=_WORKER["evidence"], all_periods=True,
+                            forecast_lookup=_WORKER.get("forecast_lookup"),
+                            stress_forecast_lookup=_WORKER.get("stress_forecast_lookup"))
+        if strategy.timeframe == "1h":
+            record_behavior(metrics, result)
         metrics["seconds"] = time.perf_counter()-before
         results.append((encode(metrics), candidate_id))
     return results
 
 
+def record_behavior(metrics, result):
+    from statistics import median
+
+    trades = result["trades"]
+    behavior = [(t["entry_timestamp"], t["exit_timestamp"], t["leg"], t["entry"], t["exit"]) for t in trades]
+    position = result["open_position"]
+    if position:
+        behavior.append((position["entry_timestamp"], None, position["leg"], position["entry"], None))
+    hours = [(t["exit_timestamp"]-t["entry_timestamp"])/3600 for t in trades]
+    metrics.update(behavior=hashlib.sha256(encode(behavior).encode()).hexdigest(),
+                   annual_net_return=(1+metrics["net_return"])**(365.25/metrics["elapsed_days"])-1,
+                   median_holding_hours=median(hours) if hours else None,
+                   held_over_24h=sum(h > 24 for h in hours)/len(hours) if hours else None)
+
+
 def make_choices(ledger, proposal, budget, seed):
     for factor in (1, 2, 4):
-        generated = matched_variants(proposal, budget*factor, seed, ["1d"])
+        generated = matched_variants(proposal, budget*factor, seed, [proposal["timeframe"]])
         ids = [identity(spec) for spec in generated]
         seen = set()
         for offset in range(0, len(ids), 500):
@@ -135,7 +174,7 @@ def schedule(root, ledger, branch, round_, protocol, history):
     if exp is not None:
         return exp
     if round_ == 0:
-        proposal = recipe("return:exit_policy")
+        proposal = recipe("return:exit_policy", timeframe=protocol.get("timeframe", "1d"))
         provider = {"model": "shared-fixed-recipe"}
     else:
         used = {e["proposal"]["indicator"] for e in history}

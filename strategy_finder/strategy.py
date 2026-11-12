@@ -40,6 +40,7 @@ class Strategy:
     time_machine: float = 0.0
     filter_rule: Rule | None = None
     exit_policy: str = "signal"
+    forecast_bars: int = 0
 
     def __post_init__(self):
         if self.timeframe not in STEPS:
@@ -53,7 +54,9 @@ class Strategy:
         if not all(type(v) in (int, float) and np.isfinite(v) and 0 <= v < 1
                    for v in (self.stop_pct, self.target_pct, self.time_machine)):
             raise ValueError("Invalid stop, target or Time Machine threshold.")
-        if self.time_machine and not (self.stop_pct and self.target_pct and 0 < self.max_hold <= 48):
+        if type(self.forecast_bars) is not int or not 0 <= self.forecast_bars <= 48:
+            raise ValueError("Invalid Time Machine forecast horizon.")
+        if self.time_machine and not (self.stop_pct and self.target_pct and 0 < self.forecast_horizon <= 48):
             raise ValueError("Time Machine requires both brackets and a 1–48 bar horizon.")
         if self.exit_policy == "bracket" and not (self.stop_pct and self.target_pct):
             raise ValueError("Bracket exit policy requires a stop and a take-profit.")
@@ -68,10 +71,16 @@ class Strategy:
 
     def to_dict(self):
         spec = asdict(self)
+        if not self.forecast_bars:
+            del spec["forecast_bars"]
         if self.exit_policy == "signal":
             # Keep existing signal strategy identities when resuming an investigation.
             del spec["exit_policy"]
         return spec
+
+    @property
+    def forecast_horizon(self):
+        return self.forecast_bars or self.max_hold
 
 
 def feature(prices, times, timeframe, rule):

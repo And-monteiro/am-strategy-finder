@@ -51,7 +51,9 @@ Signal exits can close or rotate a holding when the opposing condition fires.
 Bracket exits require a stop-loss and take-profit measured from the entry fill.
 An optional holding limit can also close the position. For rotation with bracket
 exits, the opposing signal can select asset B while the strategy is flat.
-Time Machine requires a holding limit of 1–48 bars to simulate the bracket.
+The standard discovery planner uses the holding limit of 1–48 bars as the
+Time Machine horizon. The hourly benchmark can set a separate forecast horizon
+and allow trades to stay open beyond it.
 
 - The development/final boundary is the 80% point of observed common history, rounded down to a UTC day. The planner receives development metrics only. Final candidates and thresholds are frozen before opening the final snapshot. Separate Parquet files prevent accidental reads in the discovery code. OS users with access to the run directory can still read both snapshots.
 - In the development stage, fixed rules run across the whole period and in six-month windows after the first year. Indicators can warm up from prior candles. Each scored window starts flat, first signals may fill from its second candle, and ending holdings are marked at the final close. Holdout consistency uses quarterly windows. There is no statistical fitting stage for the current rule language.
@@ -131,3 +133,17 @@ arm's SQLite ledger. The runner evaluates the sealed holdouts automatically
 after all markets finish and writes `summary.md`, `checkpoint-results.csv`,
 and `equal-trial-results.csv`. On Windows, double-click
 `Watch Learning Benchmark.bat` to see progress for that directory.
+
+To run a small hourly comparison on one prepared market:
+
+```text
+python -m strategy_finder.learning_benchmark prepare runs/hourly-test --assets BTC --start 2024-01-01 --end 2026-11-01 --timeframes 1h --fixed-allocation 0.10
+python -m strategy_finder.long_learning_benchmark run runs/hourly-test --markets BTC --timeframe 1h --batch 5000 --max-batches 1 --workers-per-arm 2 --seconds 3600
+python -m strategy_finder.long_learning_benchmark status runs/hourly-test --watch
+```
+
+Use a separate directory for a longer test if the smoke run opened its
+holdout. The hourly report counts distinct trade histories and tracks new
+qualifiers at 10% and 15% annualized net return, below 30% drawdown and above
+0.8 Sharpe. Its Time Machine actions use a 24-hour forecast at 20%, 30%, or
+40% target-hit probability. The holding limit remains optional.

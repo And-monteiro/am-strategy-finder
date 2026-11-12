@@ -36,11 +36,9 @@ class Execution:
         return min(self.allocation, self.risk / stop_pct)
 
 
-def time_machine(bars, times, i, leg, strategy, execution, seed, paths=192):
+def forecast_paths(bars, times, i, leg, horizon, step, bracket_exit, seed, paths=192):
     """Joint block draws from completed history, anchored at signal close."""
-    horizon = strategy.max_hold
     block = min(4, horizon)
-    step = STEPS[strategy.timeframe]
     start = max(1, i - 730)
     candidates = np.arange(start, i - block + 2)
     if len(candidates):
@@ -49,13 +47,23 @@ def time_machine(bars, times, i, leg, strategy, execution, seed, paths=192):
         return None
     rng = np.random.default_rng(np.random.SeedSequence([seed, int(times[i] // 3600)]))
     # An expiring bracket exits at the next open after its last active bar.
-    length = horizon + (strategy.exit_policy == "bracket")
+    length = horizon + bracket_exit
     draws = rng.choice(candidates, (paths, (length + block - 1) // block))
     indexes = (draws[..., None] + np.arange(block)).reshape(paths, -1)[:, :length]
     ratios = bars[indexes, leg, :4] / bars[indexes - 1, leg, 3, None]
     growth = np.cumprod(ratios[:, :, 3], axis=1)
     preceding = np.column_stack((np.ones(paths), growth[:, :-1]))
-    price_paths = ratios * preceding[:, :, None]
+    return ratios * preceding[:, :, None], growth
+
+
+def time_machine(bars, times, i, leg, strategy, execution, seed, paths=192):
+    horizon = strategy.forecast_horizon
+    bracket_exit = strategy.exit_policy == "bracket"
+    sampled = forecast_paths(bars, times, i, leg, horizon, STEPS[strategy.timeframe],
+                             bracket_exit, seed, paths)
+    if sampled is None:
+        return None
+    price_paths, growth = sampled
     slip = execution.slippage_bps / 10000
     fee = execution.fee_bps / 10000
     entry = price_paths[:, 0, 0] * (1 + slip)
@@ -68,14 +76,15 @@ def time_machine(bars, times, i, leg, strategy, execution, seed, paths=192):
     rows = np.arange(paths)
     stopped = hit.any(axis=1) & stop_hit[rows, first]
     won = hit.any(axis=1) & ~stopped
-    expiry = price_paths[:, horizon, 0] if strategy.exit_policy == "bracket" else growth[:, -1]
+    expiry = price_paths[:, horizon, 0] if bracket_exit else growth[:, -1]
     exits = np.where(stopped, np.minimum(stop, price_paths[rows, first, 0]),
                      np.where(won, target, expiry))
     payoff = exits * (1-slip) * (1-fee) / (entry * (1+fee)) - 1
     return float(won.mean()), float(stopped.mean()), float((~(won | stopped)).mean()), float(payoff.mean())
 
 
-def simulate(times, bars, signal, strategy, execution, start, stop, seed=19, tm_cache=None, deadline=None):
+def simulate(times, bars, signal, strategy, execution, start, stop, seed=19, tm_cache=None, deadline=None,
+             forecast_lookup=None):
     import time
 
     cash = execution.capital
@@ -113,11 +122,45 @@ def simulate(times, bars, signal, strategy, execution, start, stop, seed=19, tm_
         elif strategy.target_pct and high >= ceiling:
             close(index, ceiling, "target")
 
-    for i in range(start, stop):
-        if deadline is not None and i % 128 == 0 and time.time() >= deadline:
+    hourly = step == STEPS["1h"] and stop-start >= 256
+    if hourly:
+        desired_by_bar = np.full(stop-start, -2, dtype=int)
+        desired_by_bar[1:] = np.where(np.diff(times[start:stop]) == step, signal[start:stop-1], -2)
+        entries = np.flatnonzero(desired_by_bar >= 0)+start
+    i = start
+    while i < stop:
+        if deadline is not None and (hourly or i % 128 == 0) and time.time() >= deadline:
             raise EvaluationDeadline("Candidate exceeded its evaluation deadline.")
-        continuous = i > 0 and times[i] - times[i-1] == step
-        desired = int(signal[i-1]) if i > start and continuous else -2
+        if hourly:
+            desired = int(desired_by_bar[i-start])
+            if leg < 0 and desired < 0:
+                next_entry = entries.searchsorted(i)
+                end = int(entries[next_entry]) if next_entry < len(entries) else stop
+                equity.extend([float(cash)]*(end-i))
+                i = end
+                continue
+            if leg >= 0:
+                end = min(i+256, stop)
+                selected = bars[i:end, leg]
+                event = np.zeros(end-i, dtype=bool)
+                if strategy.max_hold:
+                    event |= times[i:end] >= times[entry_i]+strategy.max_hold*step
+                if strategy.exit_policy == "signal":
+                    ahead = desired_by_bar[i-start:end-start]
+                    event |= (ahead != -2) & (ahead != leg)
+                if strategy.stop_pct:
+                    event |= selected[:, 2] <= entry_price*(1-strategy.stop_pct)
+                if strategy.target_pct:
+                    event |= selected[:, 1] >= entry_price*(1+strategy.target_pct)
+                length = int(event.argmax()) if event.any() else end-i
+                if length:
+                    equity.extend((cash+shares*selected[:length, 3]).tolist())
+                    occupied += length
+                    i += length
+                    continue
+        else:
+            continuous = i > 0 and times[i] - times[i-1] == step
+            desired = int(signal[i-1]) if i > start and continuous else -2
         expired = leg >= 0 and strategy.max_hold and times[i] - times[entry_i] >= strategy.max_hold * step
         signal_exit = strategy.exit_policy == "signal" and leg >= 0 and desired not in (-2, leg)
         if expired or signal_exit:
@@ -126,13 +169,16 @@ def simulate(times, bars, signal, strategy, execution, start, stop, seed=19, tm_
             permitted = True
             forecast = None
             if strategy.time_machine:
-                key = (i-1, desired, strategy.max_hold, strategy.stop_pct, strategy.target_pct,
-                       strategy.exit_policy)
-                if key not in tm_cache:
-                    if len(tm_cache) >= 60_000:
-                        tm_cache.clear()
-                    tm_cache[key] = time_machine(bars, times, i-1, desired, strategy, execution, seed)
-                forecast = tm_cache[key]
+                if forecast_lookup is not None:
+                    forecast = forecast_lookup(i-1, strategy)
+                else:
+                    key = (i-1, desired, strategy.forecast_horizon, strategy.stop_pct, strategy.target_pct,
+                           strategy.exit_policy)
+                    if key not in tm_cache:
+                        if len(tm_cache) >= 60_000:
+                            tm_cache.clear()
+                        tm_cache[key] = time_machine(bars, times, i-1, desired, strategy, execution, seed)
+                    forecast = tm_cache[key]
                 permitted = bool(forecast and forecast[0] >= strategy.time_machine and forecast[3] > 0)
                 if forecast is not None:
                     forecasts.append({"timestamp": int(times[i]), "leg": desired,
@@ -151,6 +197,7 @@ def simulate(times, bars, signal, strategy, execution, start, stop, seed=19, tm_
         bracket(i)
         mark = cash + (shares * bars[i, leg, 3] if leg >= 0 else 0)
         equity.append(float(mark))
+        i += 1
     return {"equity": equity, "trades": trades, "forecasts": forecasts, "costs": float(costs),
             "turnover": float(turnover / execution.capital), "exposure": occupied / max(1, stop-start),
             "open_position": None if leg < 0 else {"leg": leg, "quantity": shares,
