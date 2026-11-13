@@ -1,5 +1,5 @@
 param(
-    [string]$Run = 'runs/programmatic-search-comparison',
+    [string]$Run = 'runs/programmatic-search-8h',
     [switch]$Once
 )
 
@@ -37,6 +37,12 @@ do {
         }
         foreach ($market in $protocol.market_order) {
             Write-Host $market
+            $clock = Read-RunJson (Join-Path (Join-Path $root $market) 'budget-clock.json')
+            if ($clock -and $status.market -eq $market) {
+                $deadline = [DateTimeOffset]::FromUnixTimeSeconds([long][Math]::Floor($clock.deadline))
+                $remaining = [Math]::Max(0, ($deadline - [DateTimeOffset]::UtcNow).TotalSeconds)
+                Write-Host ('  Market time remaining {0:hh\:mm\:ss}' -f [TimeSpan]::FromSeconds($remaining))
+            }
             foreach ($arm in $protocol.arms) {
                 $directory = Join-Path (Join-Path $root $market) $arm
                 $endpoint = Read-RunJson (Join-Path $directory 'endpoint.json')

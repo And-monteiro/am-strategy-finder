@@ -198,8 +198,8 @@ the search and freeze picks with the holdout sealed. Pass an earlier
 Use `--compare-programmatic` to compare the legacy and revised programmatic
 designers with the same warm-up, rule catalogue, and primary shortlist
 ranking. The runner also evaluates a family-diverse shortlist for each arm.
-Double-click `Watch Learning Benchmark.bat` to follow
-`runs/programmatic-search-comparison`.
+Pass `-Run runs/programmatic-search-comparison` to the Windows monitor for
+the fixed-batch comparison.
 
 For a timed programmatic comparison, add `--wall-seconds 28800`.
 The per-market clock includes the ten shared warm-up batches and the
@@ -209,3 +209,5 @@ and shortlist preparation time. It stops starting rounds when the next
 round would use the reserve. Both arms run each round on the same worker
 pool in sequence. After all markets freeze, every frozen holdout candidate
 is scored even if evaluation takes longer than the estimate.
+Double-click `Watch Learning Benchmark.bat` to follow the timed run in
+`runs/programmatic-search-8h`.
