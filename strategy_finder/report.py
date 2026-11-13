@@ -12,6 +12,7 @@ from .backtest import Execution, metrics, simulate
 from .data import STEPS
 from .feedback import campaign_map, rich_context
 from .research import STAGES, counts, development_history, experiment_report, load_data, write_json
+from .smc import INDICATORS as SMC_INDICATORS
 from .strategy import Strategy, pine, signals
 
 
@@ -123,7 +124,8 @@ def _details(item, strategy, root, config, datasets, execution):
     allocation = execution.allocation_for_stop(strategy.stop_pct)
     script, status = pine(strategy, config["assets"], execution.capital, allocation, execution.fee_bps,
                           execution.slippage_bps, int(times[0]), int(times[-1])+step)
-    (path / "strategy.pine").write_text(script, encoding="utf-8")
+    if script:
+        (path / "strategy.pine").write_text(script, encoding="utf-8")
     return status
 
 
@@ -166,7 +168,10 @@ def publish(root, ledger, summarize=True):
     qualified = sorted([r for r in candidates if r["final"] and r["final"]["outcome"] == "qualified"],
                        key=ranking, reverse=True)
     overall = shortlist(qualified)
-    tradingview = shortlist([r for r in qualified if len(config["assets"]) == 1 and not r["strategy"]["time_machine"]])
+    tradingview = shortlist([r for r in qualified if len(config["assets"]) == 1
+                             and not r["strategy"]["time_machine"]
+                             and all(rule is None or rule["indicator"] not in SMC_INDICATORS
+                                     for rule in (r["strategy"]["rule"], r["strategy"].get("filter_rule")))])
     artifacts = {r["id"]: r for r in overall + tradingview}
     if artifacts:
         datasets = load_data(root, config, final=True)
@@ -258,9 +263,12 @@ def publish(root, ledger, summarize=True):
             spec, build, out = item["strategy"], item["development"], item["final"]
             rate = "—" if out["win_rate"] is None else format(out["win_rate"], ".1%")
             sharpe = "—" if out["sharpe"] is None else format(out["sharpe"], ".2f")
+            pine_status = item["pine_status"]
+            if pine_status != "python_only_smc":
+                pine_status = f'[{pine_status}]({item["artifacts"]}/strategy.pine)'
             lines.append(f'| [{spec["timeframe"]} {spec["rule"]["indicator"]}]({item["artifacts"]}/strategy.json) '
                          f'| {build["net_return"]:.1%} | {out["net_return"]:.1%} | {item["full"]["net_return"]:.1%} | {out["max_drawdown"]:.1%} '
-                         f'| {rate} | {sharpe} | {out["trades"]} | [{item["pine_status"]}]({item["artifacts"]}/strategy.pine) |')
+                         f'| {rate} | {sharpe} | {out["trades"]} | {pine_status} |')
     if ai:
         lines.extend(["", "## AI commentary", ""] + ["- " + t for t in ai["text"]["findings"] + ai["text"]["limitations"]])
     lines.extend(["", "[Time Machine probabilities by candidate and period](time-machine-probabilities.csv). "

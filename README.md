@@ -167,3 +167,23 @@ Double-click `Watch Learning Benchmark.bat` to monitor this run. Each arm
 records its batch decisions, parameter frequencies, performance distributions,
 and distinct trade histories. Both arms on all markets freeze equally sized
 shortlists before the runner reads any holdout.
+
+The designer benchmark also supports Smart Money Concepts on single-asset
+OHLC candles. Use BOS, CHoCH, fair value gaps, and order blocks as entries or
+as confirmation for another rule. An event is available at its confirmation
+bar's close and orders use the next eligible open.
+
+- BOS and CHoCH use confirmed symmetric swings. Smaller pivot lengths track
+  internal structure, and larger lengths track swing structure. The first
+  break establishes direction. A break against that direction is CHoCH.
+- Fair value gaps use the outer wicks of three completed candles.
+- Order blocks use the last opposing candle between a confirmed pivot and its
+  break, with body or full-range bounds.
+- Zones support formation, touch, midpoint, or rejection triggers. The
+  designer can vary zone size, age, invalidation, repeat retests, and how long
+  a confirmation event stays eligible. Gaps in candles reset the state.
+
+These definitions are inspired by
+[LuxAlgo's SMC indicator](https://www.luxalgo.com/library/indicator/smart-money-concepts-smc/).
+The SMC rules currently execute in Python. Reports mark their Pine export
+status as `python_only_smc`.

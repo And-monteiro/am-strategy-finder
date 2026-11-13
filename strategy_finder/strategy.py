@@ -1,9 +1,10 @@
 """The supported rule language and its TradingView compiler."""
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 
 import numpy as np
 
 from .data import STEPS
+from . import smc
 
 
 @dataclass(frozen=True)
@@ -13,9 +14,17 @@ class Rule:
     entry: float
     exit: float | None
     direction: str
+    smc_recent: int = 1
+    smc_trigger: str = "formation"
+    smc_max_age: int = 48
+    smc_min_size: float = 0.
+    smc_wick_break: bool = False
+    smc_wick_invalidation: bool = False
+    smc_first_retest: bool = True
+    smc_body: bool = False
 
     def __post_init__(self):
-        if self.indicator not in {"zscore", "return", "sma_distance", "breakout", "volatility"}:
+        if self.indicator not in {"zscore", "return", "sma_distance", "breakout", "volatility", *smc.INDICATORS}:
             raise ValueError("Unsupported indicator.")
         if type(self.lookback) is not int or not 2 <= self.lookback <= 365:
             raise ValueError("Lookback must be an integer from 2 to 365 bars.")
@@ -24,7 +33,19 @@ class Rule:
         thresholds = (self.entry,) if self.exit is None else (self.entry, self.exit)
         if not all(type(x) in (int, float) and np.isfinite(x) for x in thresholds):
             raise ValueError("Thresholds must be finite numbers.")
-        if self.exit is not None:
+        if self.indicator in smc.INDICATORS:
+            if self.entry != 0 or self.exit not in (None, 0):
+                raise ValueError("SMC uses directional events, with 0 as the event threshold.")
+            if not all(type(v) is int and 1 <= v <= 365 for v in (self.smc_recent, self.smc_max_age)):
+                raise ValueError("Invalid SMC event or zone age.")
+            if self.smc_trigger not in ("formation", "touch", "midpoint", "rejection"):
+                raise ValueError("Invalid SMC zone trigger.")
+            if not type(self.smc_min_size) in (int, float) or not 0 <= self.smc_min_size < 1:
+                raise ValueError("Invalid minimum SMC zone size.")
+            if not all(type(v) is bool for v in (self.smc_wick_break, self.smc_wick_invalidation,
+                                                self.smc_first_retest, self.smc_body)):
+                raise ValueError("SMC switches must be booleans.")
+        elif self.exit is not None:
             ordered = self.entry > self.exit if self.direction == "above" else self.entry < self.exit
             if not ordered:
                 raise ValueError("Entry and opposing thresholds must be ordered.")
@@ -71,6 +92,11 @@ class Strategy:
 
     def to_dict(self):
         spec = asdict(self)
+        for key in ("rule", "filter_rule"):
+            if spec[key] is not None:
+                for f in fields(Rule):
+                    if f.name.startswith("smc_") and spec[key][f.name] == f.default:
+                        del spec[key][f.name]
         if not self.forecast_bars:
             del spec["forecast_bars"]
         if self.exit_policy == "signal":
@@ -115,6 +141,11 @@ def feature(prices, times, timeframe, rule):
 
 
 def signals(times, bars, strategy, cache):
+    def event_rule(rule):
+        return rule is not None and rule.indicator in smc.INDICATORS
+
+    if bars.shape[1] != 1 and any(map(event_rule, (strategy.rule, strategy.filter_rule))):
+        raise ValueError("SMC rules require single-asset OHLC candles.")
     series = bars[:, 0, 3] if bars.shape[1] == 1 else bars[:, 0, 3] / bars[:, 1, 3]
     def get(rule):
         key = (strategy.timeframe, rule.indicator, rule.lookback)
@@ -124,26 +155,33 @@ def signals(times, bars, strategy, cache):
             cache[key] = feature(series, times, strategy.timeframe, rule)
         return cache[key]
 
+    def masks(rule):
+        if event_rule(rule):
+            key = ("smc_events", strategy.timeframe, rule)
+            if key not in cache:
+                smc.store(cache, key, smc.event_masks(times, bars[:, 0], STEPS[strategy.timeframe], rule, cache))
+            bullish, bearish = cache[key]
+            return (bullish, bearish) if rule.direction == "above" else (bearish, bullish)
+        values = get(rule)
+        if rule.direction == "above":
+            return values > rule.entry, values < rule.exit if rule.exit is not None else None
+        return values < rule.entry, values > rule.exit if rule.exit is not None else None
+
     rule = strategy.rule
-    values = get(rule)
-    other = np.zeros(len(values), dtype=bool)
-    if rule.direction == "above":
-        first = values > rule.entry
-        if rule.exit is not None:
-            other = values < rule.exit
-    else:
-        first = values < rule.entry
-        if rule.exit is not None:
-            other = values > rule.exit
+    first, other = masks(rule)
+    if rule.exit is None:
+        other = np.zeros(len(times), dtype=bool)
     if strategy.filter_rule:
-        gate = strategy.filter_rule
-        score = get(gate)
-        first &= (score > gate.entry) if gate.direction == "above" else (score < gate.entry)
+        gate, _ = masks(strategy.filter_rule)
+        first = first & gate
     return np.where(first, 0, np.where(other, 1 if bars.shape[1] == 2 else -1, -2))
 
 
 def pine(strategy, assets, capital, allocation, fee_bps, slippage_bps, start, end):
     """Return Pine source and an explicit parity classification."""
+    if any(rule and rule.indicator in smc.INDICATORS for rule in (strategy.rule, strategy.filter_rule)):
+        return "", "python_only_smc"
+
     def expr(rule):
         n = rule.lookback
         return {

@@ -15,15 +15,55 @@ from strategy_finder.matched_planner_test import choose_program, recipe
 from strategy_finder.research import assess, matched_variants, variants
 from strategy_finder.planner import matched_offline, offline
 from strategy_finder.strategy import Rule, Strategy, pine, signals
+from strategy_finder.smc import structure
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_smc_structure_breaks_use_confirmed_pivots_and_prior_bias(self):
+        prices = np.array([8, 9, 12, 10, 9, 8, 7, 8, 10, 13, 9, 8, 6], dtype=float)
+        bars = np.repeat(prices[:, None], 5, axis=1)
+        times = np.arange(len(prices))*HOUR
+        events, pivots = structure(times, bars, HOUR, 2, False)
+        self.assertFalse(events[:9].any())
+        self.assertEqual((events[9], pivots[9]), (1, 2))
+        self.assertEqual((events[12], pivots[12]), (-2, 6))
+        for end in range(1, len(prices)):
+            partial, _ = structure(times[:end], bars[:end], HOUR, 2, False)
+            np.testing.assert_array_equal(partial, events[:end])
+
+    def test_smc_gap_retest_is_causal_and_fills_next_open(self):
+        candles = np.array([[9, 10, 8, 9, 1], [10, 13, 10, 12, 1], [13, 14, 12, 13, 1],
+                            [13, 14, 11, 13, 1], [13, 14, 11, 13, 1], [13, 14, 9, 10, 1]], dtype=float)
+        times = np.arange(len(candles))*HOUR
+        bars = candles[:, None, :]
+        rule = Rule("fvg", 2, 0, None, "above", smc_trigger="midpoint")
+        strategy = Strategy("1h", rule, stop_pct=.05, target_pct=.1, exit_policy="bracket")
+        state = signals(times, bars, strategy, {})
+        self.assertEqual(list(np.flatnonzero(state == 0)), [3])
+        result = simulate(times, bars, state, strategy, Execution(), 0, len(times))
+        self.assertEqual(result["trades"][0]["entry_timestamp"], times[4])
+        altered = times.copy()
+        altered[3:] += HOUR
+        self.assertFalse((signals(altered, bars, strategy, {}) == 0).any())
+
+    def test_smc_order_block_retest_follows_structure_break(self):
+        prices = np.array([8, 9, 12, 10, 9, 8, 7, 8, 10, 13, 10, 9], dtype=float)
+        candles = np.repeat(prices[:, None], 5, axis=1)
+        candles[6, :3] = [9, 9, 7]
+        times = np.arange(len(prices))*HOUR
+        base = Rule("order_block", 2, 0, None, "above")
+        strategy = Strategy("1h", base, stop_pct=.05, target_pct=.1, exit_policy="bracket")
+        formation = signals(times, candles[:, None, :], strategy, {})
+        self.assertEqual(list(np.flatnonzero(formation == 0)), [9])
+        retest = replace(strategy, rule=replace(base, smc_trigger="touch"))
+        self.assertEqual(list(np.flatnonzero(signals(times, candles[:, None, :], retest, {}) == 0)), [11])
+
     def test_designer_warmup_covers_families_and_matches_tool_controls(self):
         seen = set()
         first = designer_candidates(1, 100, 19, seen)
         second = designer_candidates(2, 100, 20, seen)
         self.assertEqual(len(seen), 200)
-        self.assertEqual(len({(s["design"]["family"], s["design"]["policy"]) for _, s in first}), 10)
+        self.assertEqual(len({(s["design"]["family"], s["design"]["policy"]) for _, s in first}), 18)
         for _, spec in first+second:
             self.assertEqual(strategy_for(spec).timeframe, "4h")
         for (_, control), (_, treatment) in zip(second[::2], second[1::2]):

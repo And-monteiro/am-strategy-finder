@@ -24,6 +24,7 @@ from .data import DAY, STEPS
 from .learning_benchmark import budgeted_response
 from .matched_planner_test import FAMILIES, identity, recipe, record_behavior
 from .research import encode, load_data, write_json
+from .smc import INDICATORS as SMC_FAMILIES
 from .strategy import Rule, Strategy, signals
 from .time_machine_exit_replay import forecast_exit_edge
 from .time_machine_replay import summarize
@@ -35,6 +36,7 @@ STEP = STEPS[FRAME]
 SEED = 19
 TOOLS = ("plain", "confirmation", "entry_gate", "forecast_exit", "both", "all")
 WORKER = {}
+DESIGN_FAMILIES = (*FAMILIES, *SMC_FAMILIES)
 
 
 def design(family, policy="bracket", confirmation="none", entry_gate=False, forecast_exit=False):
@@ -43,18 +45,47 @@ def design(family, policy="bracket", confirmation="none", entry_gate=False, fore
 
 
 def warmup_design(family, tool):
+    if tool in SMC_FAMILIES:
+        return design(family, confirmation=tool)
     confirmation = ("return" if family == "sma_distance" else "sma_distance") if tool in ("confirmation", "all") else "none"
     return design(family, confirmation=confirmation, entry_gate=tool in ("entry_gate", "both", "all"),
                   forecast_exit=tool in ("forecast_exit", "both", "all"))
 
 
+def warmup_pairs():
+    tools = (*TOOLS[1:], *SMC_FAMILIES)
+    return [(family, tool) for tool in tools for family in DESIGN_FAMILIES if family != tool]
+
+
+def smc_grid(family, confirmation=False):
+    values = {"lookback": [2] if family == "fvg" else [2, 3, 5, 8, 13, 21, 34],
+              "entry": [0], "smc_recent": [1, 3, 6, 12] if confirmation else [1]}
+    if family != "fvg":
+        values["smc_wick_break"] = [False, True]
+    if family in ("fvg", "order_block"):
+        values.update(smc_trigger=["formation", "touch", "midpoint", "rejection"],
+                      smc_max_age=[12, 24, 48, 96], smc_min_size=[0., .001, .003],
+                      smc_wick_invalidation=[False, True], smc_first_retest=[False, True])
+    if family == "order_block":
+        values["smc_body"] = [False, True]
+    return values
+
+
 def grid(d):
-    r = recipe(f'{d["family"]}:exit_policy', timeframe=FRAME)
-    values = {"lookback": r["lookbacks"], "entry": r["entries"], "stop": r["stops"],
-              "target": r["targets"], "hold": [0, 6, 12, 24, 48, 96, 168]}
-    if d["policy"] == "signal":
-        values["exit"] = [r["exits"][0]*factor for factor in (.8, 1., 1.5)]
-    if d["confirmation"] != "none":
+    family = d["family"]
+    r = recipe(f'{family if family in FAMILIES else "breakout"}:exit_policy', timeframe=FRAME)
+    values = {"stop": r["stops"], "target": r["targets"], "hold": [0, 6, 12, 24, 48, 96, 168]}
+    if family in SMC_FAMILIES:
+        values.update(smc_grid(family))
+        if d["policy"] == "signal":
+            values["exit"] = [0]
+    else:
+        values.update(lookback=r["lookbacks"], entry=r["entries"])
+        if d["policy"] == "signal":
+            values["exit"] = [r["exits"][0]*factor for factor in (.8, 1., 1.5)]
+    if d["confirmation"] in SMC_FAMILIES:
+        values.update({f"confirm_{key}": choices for key, choices in smc_grid(d["confirmation"], True).items()})
+    elif d["confirmation"] != "none":
         values["confirm_lookback"] = [12, 24, 48, 72, 120]
         values["confirm_threshold"] = {
             "return": [0., .005, .01], "sma_distance": [0., .0025, .005],
@@ -82,40 +113,51 @@ def sample(d, rng, parents=()):
                 params[key] = rng.choice(values)
     else:
         params = {key: rng.choice(values) for key, values in choices.items()}
-    return {"design": d, "parameters": params}
+    return {"design": d, "parameters": canonical_parameters(params)}
+
+
+def canonical_parameters(params):
+    for prefix in ("smc_", "confirm_smc_"):
+        if params.get(prefix+"trigger") == "formation":
+            for field in ("wick_invalidation", "first_retest"):
+                params.pop(prefix+field, None)
+    return params
 
 
 def apply_tool(control, d, rng):
     params = {k: v for k, v in control["parameters"].items() if k in grid(d)}
     params.update({k: rng.choice(v) for k, v in grid(d).items() if k not in params})
-    return {"design": d, "parameters": params}
+    return {"design": d, "parameters": canonical_parameters(params)}
 
 
 def strategy_for(spec):
     d, p = spec["design"], spec["parameters"]
     family = d["family"]
-    rule = Rule(family, p["lookback"], p["entry"], p.get("exit"), FAMILIES[family][0])
+    direction = FAMILIES[family][0] if family in FAMILIES else "above"
+    rule = Rule(family, p["lookback"], p["entry"], p.get("exit"), direction,
+                **{k: v for k, v in p.items() if k.startswith("smc_")})
     confirmation = d["confirmation"]
-    gate = None if confirmation == "none" else Rule(
-        confirmation, p["confirm_lookback"], p["confirm_threshold"], None,
-        "below" if confirmation == "volatility" else "above")
+    gate = None
+    if confirmation != "none":
+        gate = Rule(confirmation, p["confirm_lookback"], p.get("confirm_threshold", 0), None,
+                    "below" if confirmation == "volatility" else "above",
+                    **{k.removeprefix("confirm_"): v for k, v in p.items() if k.startswith("confirm_smc_")})
     return Strategy(FRAME, rule, p["hold"], p["stop"], p["target"], filter_rule=gate, exit_policy=d["policy"])
 
 
 def candidates(batch, budget, seed, seen, decision=None, parents=()):
     rng = random.Random(seed)
     records = []
+    pairs = warmup_pairs() if batch == 2 else ()
     for attempt in range(budget*50):
         if len(records) >= budget:
             return records
         if batch == 1:
-            slot = len(records) % (2*len(FAMILIES))
-            family = tuple(FAMILIES)[slot//2]
+            slot = len(records) % (2*len(DESIGN_FAMILIES))
+            family = DESIGN_FAMILIES[slot//2]
             group = [sample(design(family, ("bracket", "signal")[slot%2]), rng)]
         elif batch == 2:
-            slot = (len(records)//2) % (len(FAMILIES)*(len(TOOLS)-1))
-            family = tuple(FAMILIES)[slot//(len(TOOLS)-1)]
-            tool = TOOLS[1+slot%(len(TOOLS)-1)]
+            family, tool = pairs[(len(records)//2) % len(pairs)]
             base = sample(design(family), rng)
             group = [base, apply_tool(base, warmup_design(family, tool), rng)]
         else:
@@ -261,8 +303,8 @@ def campaign(reports):
 def programmatic(summary, batch, seed):
     observed = {encode(x["design"]): x for x in summary}
     menu = [design(f, policy, confirmation, gate, early)
-            for f in FAMILIES for policy in ("signal", "bracket")
-            for confirmation in ("none", *FAMILIES) for gate in (False, True)
+            for f in DESIGN_FAMILIES for policy in ("signal", "bracket")
+            for confirmation in ("none", *DESIGN_FAMILIES) for gate in (False, True)
             for early in (False, True) if not early or policy == "bracket"]
     def utility(x):
         return (x["qualifiers"]/x["trials"], median(x["median_window_returns"]),
@@ -280,13 +322,13 @@ def programmatic(summary, batch, seed):
 def luna(root, config, batch, summary, reports, records, budget):
     schema = planner.obj({
         "design": planner.obj({
-            "family": {"type": "string", "enum": list(FAMILIES)},
+            "family": {"type": "string", "enum": list(DESIGN_FAMILIES)},
             "policy": {"type": "string", "enum": ["bracket", "signal", "bracket_forecast"]},
-            "confirmation": {"type": "string", "enum": ["none", *FAMILIES]},
+            "confirmation": {"type": "string", "enum": ["none", *DESIGN_FAMILIES]},
             "entry_gate": {"type": "boolean"},
         }),
         "sampling": {"type": "string", "enum": ["broad", "refine"]}, "reason": planner.STRING,
-        "search_family": {"type": "string", "enum": ["none", *FAMILIES]},
+        "search_family": {"type": "string", "enum": ["none", *DESIGN_FAMILIES]},
     })
     prompt = ("Design the next experiment from the development-only results. You may combine the supported "
               "tools or revisit a design. Broad draws from the full parameter grid. Refine also samples "
@@ -375,7 +417,7 @@ def run_batch(db, pool, batch, decision, budget, horizon, initial, seed):
     if batch == 2:
         pairs = list(zip(records[::2], records[1::2]))
         result["paired_tools"] = []
-        for tool in TOOLS[1:]:
+        for tool in (*TOOLS[1:], *SMC_FAMILIES):
             selected = [(a[1],b[1]) for a,b in pairs if b[0]["design"] == warmup_design(b[0]["design"]["family"], tool)]
             if selected:
                 result["paired_tools"].append({"tool": tool, "pairs": len(selected),
@@ -533,6 +575,7 @@ def main():
                 or not config["execution"]["fixed_allocation"] or config["drawdown"] != .30):
             raise ValueError("Prepare single-asset 4h spot data with EUR 1,000, full allocation, and 30% drawdown cap.")
     protocol = {"market_order": args.markets, "markets": configs, "arms": ARMS, "batch": args.batch,
+                "families": list(DESIGN_FAMILIES),
                 "batches": args.batches, "workers": args.workers, "max_api_usd": args.max_api_usd,
                 "shortlist": 10, "model": "gpt-6-luna", "seed": SEED}
     protocol = json.loads(encode(protocol))
