@@ -9,7 +9,7 @@ import random
 import sqlite3
 import time
 from collections import Counter, OrderedDict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import ExitStack, closing
 from dataclasses import replace
 from pathlib import Path
@@ -556,7 +556,7 @@ def estimate_selection(work, selections, config):
                             counts["development_bars"], counts["final_bars"])
 
 
-def discover(root, market, config, protocol):
+def discover(root, market, config, protocol, workers=None):
     setup = root/market
     budget, rounds = protocol["batch"], protocol["batches"]
     arms = protocol["arms"]
@@ -574,9 +574,9 @@ def discover(root, market, config, protocol):
     remembered = protocol["development_memory"].get(market, [])
     if all((directories[arm]/"endpoint.json").exists() for arm in arms):
         return
-    status(root, "shared_warmup", market)
+    status(setup, "shared_warmup", market)
     with (ExitStack() as stack, closing(open_db(directories["shared"]/"design.sqlite")) as shared,
-          ProcessPoolExecutor(max_workers=protocol["workers"], initializer=setup_worker,
+          ProcessPoolExecutor(max_workers=workers or protocol["workers"], initializer=setup_worker,
                               initargs=(setup, config, False)) as pool):
         warmup = [run_batch(shared, pool, 1, None, budget, 11, [], SEED)]
         holds = [hours for hours, in shared.execute(
@@ -596,7 +596,7 @@ def discover(root, market, config, protocol):
         for directory in (directories[a] for a in arms):
             write_json(directory/"batch-history.json", warmup)
             update_progress(directory, warmup, budget)
-        status(root, "discovery", market)
+        status(setup, "discovery", market)
         work = {}
         last_completed = warmup_count
         for batch in range(warmup_count+1, rounds+1):
@@ -622,7 +622,7 @@ def discover(root, market, config, protocol):
                     "remaining_seconds": round(remaining), "next_round_seconds": round(batch_estimate),
                 }
                 write_json(clock_path, clock)
-                status(root, "discovery", market, holdout_candidates=len(preview), reserve_seconds=reserve,
+                status(setup, "discovery", market, holdout_candidates=len(preview), reserve_seconds=reserve,
                        remaining_seconds=max(0, round(remaining)), next_round_seconds=round(batch_estimate),
                        completed_batches=last_completed)
                 if remaining < reserve+batch_estimate:
@@ -684,6 +684,7 @@ def discover(root, market, config, protocol):
             "split": config["split"], "development_hash": config["datasets"][FRAME]["development_hash"],
             "reports": remembered+warmup+histories["programmatic"],
         })
+    status(setup, "holdouts_ready", market)
 
 
 def read(path):
@@ -763,6 +764,8 @@ def main():
     cli.add_argument("--warmup-batches", type=int)
     cli.add_argument("--checkpoint-every", type=int, default=10, help="Adaptive batches between holdout checkpoints.")
     cli.add_argument("--workers", type=int, default=8)
+    cli.add_argument("--parallel-markets", action="store_true",
+                     help="Run programmatic markets concurrently within the total worker count.")
     cli.add_argument("--max-api-usd", type=float, default=12.)
     mode = cli.add_mutually_exclusive_group()
     mode.add_argument("--programmatic-only", action="store_true")
@@ -771,6 +774,8 @@ def main():
     cli.add_argument("--memory", type=Path, action="append", default=[],
                      help="Reuse a compatible development-memory.json from an earlier investigation.")
     args = cli.parse_args()
+    if args.parallel_markets and (not args.compare_programmatic or args.workers < len(args.markets)):
+        cli.error("Parallel markets require programmatic comparison and at least one worker per market.")
     warmup_count = args.warmup_batches if args.warmup_batches is not None else (10 if args.wall_seconds else 2)
     rounds = args.batches if args.batches is not None else (100_000 if args.wall_seconds else 20)
     if args.wall_seconds is not None and (args.wall_seconds <= 0 or not args.compare_programmatic):
@@ -822,8 +827,18 @@ def main():
                     db.execute("CREATE TABLE IF NOT EXISTS requests (id INTEGER PRIMARY KEY, microdollars INTEGER)")
                     db.execute("CREATE TABLE IF NOT EXISTS api_block (id INTEGER PRIMARY KEY, reason TEXT NOT NULL)")
                     db.execute("DELETE FROM api_block")
-            for market, config in configs.items():
-                discover(root, market, config, protocol)
+            status(root, "discovery")
+            if args.parallel_markets:
+                count = len(configs)
+                with ThreadPoolExecutor(max_workers=count) as markets:
+                    futures = [markets.submit(discover, root, market, config, protocol,
+                                              args.workers//count + (i < args.workers%count))
+                               for i, (market, config) in enumerate(configs.items())]
+                    for future in as_completed(futures):
+                        future.result()
+            else:
+                for market, config in configs.items():
+                    discover(root, market, config, protocol)
             if args.discovery_only:
                 status(root, "holdouts_ready")
                 return

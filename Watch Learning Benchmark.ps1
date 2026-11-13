@@ -37,11 +37,16 @@ do {
         }
         foreach ($market in $protocol.market_order) {
             Write-Host $market
-            $clock = Read-RunJson (Join-Path (Join-Path $root $market) 'budget-clock.json')
-            if ($clock -and $status.market -eq $market) {
+            $marketRoot = Join-Path $root $market
+            $clock = Read-RunJson (Join-Path $marketRoot 'budget-clock.json')
+            $marketStatus = Read-RunJson (Join-Path $marketRoot 'status.json')
+            if ($clock -and ($status.market -eq $market -or $marketStatus.phase -in @('shared_warmup', 'discovery'))) {
                 $deadline = [DateTimeOffset]::FromUnixTimeSeconds([long][Math]::Floor($clock.deadline))
                 $remaining = [Math]::Max(0, ($deadline - [DateTimeOffset]::UtcNow).TotalSeconds)
                 Write-Host ('  Market time remaining {0:hh\:mm\:ss}' -f [TimeSpan]::FromSeconds($remaining))
+            }
+            if ($null -ne $marketStatus.reserve_seconds -and $marketStatus.phase -eq 'discovery') {
+                Write-Host "  Holdout reserve $($marketStatus.reserve_seconds)s | Estimated unique candidates $($marketStatus.holdout_candidates)"
             }
             foreach ($arm in $protocol.arms) {
                 $directory = Join-Path (Join-Path $root $market) $arm
