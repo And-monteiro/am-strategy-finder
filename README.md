@@ -200,3 +200,12 @@ designers with the same warm-up, rule catalogue, and primary shortlist
 ranking. The runner also evaluates a family-diverse shortlist for each arm.
 Double-click `Watch Learning Benchmark.bat` to follow
 `runs/programmatic-search-comparison`.
+
+For a timed programmatic comparison, add `--wall-seconds 28800`.
+The per-market clock includes the ten shared warm-up batches and the
+adaptive discovery rounds. The runner estimates the holdout reserve from
+unique checkpoint and endpoint candidates, measured development runtime,
+and shortlist preparation time. It stops starting rounds when the next
+round would use the reserve. Both arms run each round on the same worker
+pool in sequence. After all markets freeze, every frozen holdout candidate
+is scored even if evaluation takes longer than the estimate.

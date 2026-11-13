@@ -28,6 +28,9 @@ do {
         Write-Host "Waiting for run status in $root"
     } else {
         Write-Host "Phase $($status.phase) | PID $($status.pid)"
+        if ($null -ne $status.reserve_seconds) {
+            Write-Host "Holdout reserve $($status.reserve_seconds)s | Estimated unique candidates $($status.holdout_candidates) | Time left $($status.remaining_seconds)s"
+        }
         if ($status.deadline) {
             $deadline = [DateTimeOffset]::Parse($status.deadline.ToString()).ToLocalTime()
             Write-Host "Deadline $($deadline.ToString('yyyy-MM-dd HH:mm:ss zzz'))"

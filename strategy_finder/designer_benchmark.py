@@ -17,7 +17,7 @@ from statistics import median
 
 import numpy as np
 
-from . import design_search, planner
+from . import design_search, holdout_budget, planner
 from .backtest import Execution, forecast_paths, simulate, time_machine
 from .cli import lock
 from .data import DAY, STEPS
@@ -243,7 +243,13 @@ def evaluate(spec, horizon):
 
 
 def evaluate_chunk(chunk, horizon):
-    return [(key, evaluate(spec, horizon)) for key, spec in chunk]
+    results = []
+    for key, spec in chunk:
+        started = time.perf_counter()
+        m = evaluate(spec, horizon)
+        m["evaluation_seconds"] = time.perf_counter()-started
+        results.append((key, m))
+    return results
 
 
 def qualifies(m, floor=.10):
@@ -394,9 +400,10 @@ def open_db(path):
     return db
 
 
-def prior(db):
-    return [(json.loads(s), json.loads(m)) for s, m in db.execute(
-        "SELECT spec,metrics FROM trials WHERE metrics IS NOT NULL")]
+def prior(db, through=None):
+    sql = "SELECT spec,metrics FROM trials WHERE metrics IS NOT NULL"
+    rows = db.execute(sql) if through is None else db.execute(sql+" AND batch<=?", (through,))
+    return [(json.loads(s), json.loads(m)) for s, m in rows]
 
 
 def refinement_parents(history, target):
@@ -456,7 +463,7 @@ def record_comparisons(records, decision):
     return comparisons
 
 
-def run_batch(db, pool, batch, decision, budget, horizon, initial, seed):
+def run_batch(db, pool, batch, decision, budget, horizon, initial, seed, warmup_kind=None):
     row = db.execute("SELECT decision,report FROM batches WHERE n=?", (batch,)).fetchone()
     if row and row[1]:
         return json.loads(row[1])
@@ -474,7 +481,7 @@ def run_batch(db, pool, batch, decision, budget, horizon, initial, seed):
                 same_family = [(s, m) for s, m in history if s["design"]["family"] == family]
                 parents = [s["parameters"] for s, _ in sorted(
                     same_family, key=lambda item: rank(item[1]), reverse=True)[:32]]
-            batch_candidates = candidates(batch, budget, seed, seen, decision, parents)
+            batch_candidates = candidates(warmup_kind or batch, budget, seed, seen, decision, parents)
         with db:
             db.execute("INSERT INTO batches VALUES (?,?,NULL)", (batch, encode(decision)))
             db.executemany("INSERT INTO trials VALUES (?,?,?,NULL)", [(i,batch,encode(s)) for i,s in batch_candidates])
@@ -492,7 +499,7 @@ def run_batch(db, pool, batch, decision, budget, horizon, initial, seed):
     result.update(batch=batch, decision=decision)
     if decision and "allocations" in decision:
         result["comparisons"] = record_comparisons(records, decision)
-    if batch == 2:
+    if (warmup_kind or batch) == 2:
         pairs = list(zip(records[::2], records[1::2]))
         result["paired_tools"] = []
         for tool in (*TOOLS[1:], *SMC_FAMILIES):
@@ -538,11 +545,29 @@ def update_progress(directory, history, batch_size):
                                           "completed_batches": len(history)})
 
 
+def shortlist_snapshot(records, count, comparison):
+    primary = freeze(records, count, diverse=not comparison)
+    return {"picks": primary, "diverse_picks": freeze(records, count, diverse=True) if comparison else []}
+
+
+def estimate_selection(work, selections, config):
+    counts = config["datasets"][FRAME]
+    holdout_budget.add_work(work, (picks for s in selections for picks in s.values()),
+                            counts["development_bars"], counts["final_bars"])
+
+
 def discover(root, market, config, protocol):
     setup = root/market
     budget, rounds = protocol["batch"], protocol["batches"]
     arms = protocol["arms"]
     comparison = "legacy" in arms
+    warmup_count = protocol.get("warmup_batches", 2)
+    seconds = protocol.get("wall_seconds")
+    clock_path = setup/"budget-clock.json"
+    clock = read(clock_path) if seconds and clock_path.exists() else {}
+    if seconds and not clock:
+        clock = {"deadline": time.time()+seconds, "round_seconds": [], "selection_seconds": 0.}
+        write_json(clock_path, clock)
     directories = {arm: setup/arm for arm in ("shared", *arms)}
     for directory in directories.values():
         directory.mkdir(exist_ok=True)
@@ -560,13 +585,50 @@ def discover(root, market, config, protocol):
         write_json(setup/"forecast-horizon.json", {"bars": horizon,
                    "method": "75th percentile of candidate median holding times in shared batch one, plus exit bar"})
         warmup.append(run_batch(shared, pool, 2, None, budget, horizon, [], SEED+1))
+        for n in range(3, warmup_count+1):
+            warmup.append(run_batch(shared, pool, n, None, budget, horizon, [], SEED+n-1,
+                                    warmup_kind=1 if n % 2 else 2))
         write_json(directories["shared"]/"batch-history.json", warmup)
         print(market, "shared warm-up complete", horizon, "forecast bars", flush=True)
         shared_records = prior(shared)
         histories = {a: [] for a in arms}
         dbs = {a: stack.enter_context(closing(open_db(directories[a]/"design.sqlite"))) for a in arms}
+        for directory in (directories[a] for a in arms):
+            write_json(directory/"batch-history.json", warmup)
+            update_progress(directory, warmup, budget)
         status(root, "discovery", market)
-        for batch in range(3, rounds+1):
+        work = {}
+        last_completed = warmup_count
+        for batch in range(warmup_count+1, rounds+1):
+            completed = [db.execute("SELECT report FROM batches WHERE n=?", (batch,)).fetchone()
+                         for db in dbs.values()]
+            already_started = any(completed)
+            if seconds and not already_started:
+                started_selection = time.perf_counter()
+                current = [shortlist_snapshot(shared_records+prior(db), protocol["shortlist"], comparison)
+                           for db in dbs.values()]
+                preview = work.copy()
+                estimate_selection(preview, current, config)
+                clock["selection_seconds"] = max(clock["selection_seconds"], time.perf_counter()-started_selection)
+                # Budget one additional list per arm/selection in case the next batch replaces every pick.
+                buffer = len(arms)*protocol["shortlist"]*(2 if comparison else 1)*max(preview.values(), default=.12)
+                checkpoint_count = (last_completed-warmup_count)//protocol["checkpoint_every"]
+                reserve = holdout_budget.reserve_seconds(
+                    preview, clock["selection_seconds"]*(checkpoint_count+2)+buffer)
+                batch_estimate = 1.3*max(clock["round_seconds"][-5:], default=60.)
+                remaining = clock["deadline"]-time.time()
+                clock.setdefault("estimates", {})[str(batch)] = {
+                    "unique_candidates": len(preview), "reserve_seconds": reserve,
+                    "remaining_seconds": round(remaining), "next_round_seconds": round(batch_estimate),
+                }
+                write_json(clock_path, clock)
+                status(root, "discovery", market, holdout_candidates=len(preview), reserve_seconds=reserve,
+                       remaining_seconds=max(0, round(remaining)), next_round_seconds=round(batch_estimate),
+                       completed_batches=last_completed)
+                if remaining < reserve+batch_estimate:
+                    print(market, "discovery stopped to reserve", reserve, "seconds for holdout", flush=True)
+                    break
+            round_start = time.perf_counter()
             for arm in arms:
                 db = dbs[arm]
                 existing = db.execute("SELECT decision FROM batches WHERE n=?", (batch,)).fetchone()
@@ -590,6 +652,15 @@ def discover(root, market, config, protocol):
                 update_progress(directories[arm], warmup+histories[arm], budget)
                 print(market, arm, batch, "complete", report["new_distinct"], "new histories",
                       report["new_10"], "new 10% qualifiers", flush=True)
+            last_completed = batch
+            if seconds:
+                if not already_started:
+                    clock["round_seconds"].append(time.perf_counter()-round_start)
+                    write_json(clock_path, clock)
+                if (batch-warmup_count) % protocol["checkpoint_every"] == 0:
+                    selections = [shortlist_snapshot(shared_records+prior(db, batch), protocol["shortlist"], comparison)
+                                  for db in dbs.values()]
+                    estimate_selection(work, selections, config)
         frozen, diverse = {}, {}
         for arm, db in dbs.items():
             records = shared_records+prior(db)
@@ -598,9 +669,15 @@ def discover(root, market, config, protocol):
                 diverse[arm] = freeze(records, protocol["shortlist"], diverse=True)
         common = min(len(picks) for picks in (*frozen.values(), *diverse.values()))
         for arm in arms:
+            checkpoints = {}
+            if seconds:
+                for n in range(warmup_count+protocol["checkpoint_every"], last_completed, protocol["checkpoint_every"]):
+                    snapshot = shortlist_snapshot(shared_records+prior(dbs[arm], n), common, comparison)
+                    checkpoints[str(n)] = snapshot
             write_json(directories[arm]/"endpoint.json", {
                 "picks": frozen[arm][:common], "diverse_picks": diverse.get(arm, [])[:common],
-                "backtests": rounds*budget, "completed_batches": rounds,
+                "checkpoints": checkpoints,
+                "backtests": last_completed*budget, "completed_batches": last_completed,
             })
         write_json(setup/"development-memory.json", {
             "assets": config["assets"], "frame": FRAME, "execution": config["execution"],
@@ -618,24 +695,34 @@ def evaluate_holdouts(root, protocol):
     arms = protocol["arms"]
     if not all((root/market/arm/"endpoint.json").is_file() for market in markets for arm in arms):
         raise ValueError("Freeze all shortlists before opening any holdout.")
-    rows, diverse_rows, histories = [], [], {}
+    rows, diverse_rows, checkpoints, histories, timing = [], [], [], {}, {}
+    warmup_count = protocol.get("warmup_batches", 2)
     for market in markets:
+        started = time.perf_counter()
         setup = root/market
         config = read(setup/"config.json")
         horizon = read(setup/"forecast-horizon.json")["bars"]
         setup_worker(setup, config, True)
+        evaluated = {}
         for arm in arms:
             directory = setup/arm
             histories[f"{market}/{arm}"] = read(directory/"batch-history.json")
             endpoint = read(directory/"endpoint.json")
-            evaluated = {}
             for selection, destination in (("picks", rows), ("diverse_picks", diverse_rows)):
                 for pick in endpoint.get(selection, []):
                     if pick["id"] not in evaluated:
                         evaluated[pick["id"]] = evaluate(pick["spec"], horizon)
                     destination.append({"market": market, "arm": arm, **pick, "holdout": evaluated[pick["id"]]})
+            for batch, selections in endpoint.get("checkpoints", {}).items():
+                for selection, picks in selections.items():
+                    for pick in picks:
+                        if pick["id"] not in evaluated:
+                            evaluated[pick["id"]] = evaluate(pick["spec"], horizon)
+                        checkpoints.append({"market": market, "arm": arm, "batch": int(batch),
+                                            "selection": selection, **pick, "holdout": evaluated[pick["id"]]})
+        timing[market] = {"unique_evaluations": len(evaluated), "seconds": time.perf_counter()-started}
     summary = ["# Strategy designer comparison", "",
-               "Trial counts per arm include the same two shared warm-up batches. "
+               f"Trial counts per arm include the same {warmup_count} shared warm-up batches. "
                "Holdout picks are frozen using development data before any holdout is loaded.",
                "", "| Market | Arm | New 10% qualifiers after warm-up | New stable 10% qualifiers | "
                "Holdout 10% / picks | Holdout 15% / picks | Median holdout annualized net |",
@@ -643,7 +730,7 @@ def evaluate_holdouts(root, protocol):
     for market in markets:
         for arm in arms:
             results = [r["holdout"] for r in rows if r["market"] == market and r["arm"] == arm]
-            reports = histories[f"{market}/{arm}"][2:]
+            reports = histories[f"{market}/{arm}"][warmup_count:]
             typical = f"{median(m['annual_net_return'] for m in results):.2%}" if results else "—"
             summary.append(f"| {market} | {arm} | {sum(r['new_10'] for r in reports):,} | "
                            f"{sum(r['new_stable_10'] for r in reports):,} | "
@@ -653,13 +740,15 @@ def evaluate_holdouts(root, protocol):
                     "| Market | Batch | Backtests per arm | " + " | ".join(arms) + " |",
                     "|---|---:|---:|" + "---:|"*len(arms)])
     for market in markets:
-        for batch in range(3, protocol["batches"]+1):
-            counts = [sum(r["new_10"] for r in histories[f"{market}/{arm}"][2:batch]) for arm in arms]
+        completed = min(len(histories[f"{market}/{arm}"]) for arm in arms)
+        for batch in range(warmup_count+1, completed+1):
+            counts = [sum(r["new_10"] for r in histories[f"{market}/{arm}"][warmup_count:batch]) for arm in arms]
             summary.append(f"| {market} | {batch} | {batch*protocol['batch']:,} | "
                            + " | ".join(f"{count:,}" for count in counts) + " |")
     summary.extend(["", "The detailed results contain every batch's parameter frequencies, performance quantiles, "
                     "new trade histories, matched warm-up comparisons, and frozen holdout picks."])
-    write_json(root/"results.json", {"batches": histories, "holdout": rows, "diverse_holdout": diverse_rows})
+    write_json(root/"results.json", {"batches": histories, "holdout": rows, "diverse_holdout": diverse_rows,
+                                    "checkpoint_holdout": checkpoints, "holdout_timing": timing})
     (root/"summary.md").write_text("\n".join(summary)+"\n", encoding="utf-8")
     print("\n".join(summary), flush=True)
 
@@ -669,7 +758,10 @@ def main():
     cli.add_argument("root", type=Path)
     cli.add_argument("--markets", nargs="+", required=True)
     cli.add_argument("--batch", type=int, default=5000)
-    cli.add_argument("--batches", type=int, default=20)
+    cli.add_argument("--batches", type=int)
+    cli.add_argument("--wall-seconds", type=int, help="Per-market target including warm-up, search, and holdout reserve.")
+    cli.add_argument("--warmup-batches", type=int)
+    cli.add_argument("--checkpoint-every", type=int, default=10, help="Adaptive batches between holdout checkpoints.")
     cli.add_argument("--workers", type=int, default=8)
     cli.add_argument("--max-api-usd", type=float, default=12.)
     mode = cli.add_mutually_exclusive_group()
@@ -679,9 +771,15 @@ def main():
     cli.add_argument("--memory", type=Path, action="append", default=[],
                      help="Reuse a compatible development-memory.json from an earlier investigation.")
     args = cli.parse_args()
+    warmup_count = args.warmup_batches if args.warmup_batches is not None else (10 if args.wall_seconds else 2)
+    rounds = args.batches if args.batches is not None else (100_000 if args.wall_seconds else 20)
+    if args.wall_seconds is not None and (args.wall_seconds <= 0 or not args.compare_programmatic):
+        cli.error("A positive wall-clock budget requires --compare-programmatic.")
+    if not 2 <= warmup_count < rounds or args.checkpoint_every < 1:
+        cli.error("Use at least two warm-up batches, one adaptive batch, and a positive checkpoint interval.")
     if args.compare_programmatic and args.memory:
         cli.error("The programmatic comparison starts from the shared warm-up.")
-    if args.batch < 50 or args.batch % 50 or args.batches < 3 or args.workers < 1 or args.max_api_usd <= 0:
+    if args.batch < 50 or args.batch % 50 or args.workers < 1 or args.max_api_usd <= 0:
         cli.error("Use a batch size divisible by 50, at least three batches, and positive worker and API limits.")
     root = args.root.resolve()
     configs = {market: read(root/market/"config.json") for market in args.markets}
@@ -705,7 +803,9 @@ def main():
     protocol = {"market_order": args.markets, "markets": configs, "development_memory": memory,
                 "arms": arms, "batch": args.batch,
                 "families": list(DESIGN_FAMILIES),
-                "batches": args.batches, "workers": args.workers, "max_api_usd": args.max_api_usd,
+                "batches": rounds, "workers": args.workers, "max_api_usd": args.max_api_usd,
+                "warmup_batches": warmup_count, "wall_seconds": args.wall_seconds,
+                "checkpoint_every": args.checkpoint_every,
                 "shortlist": 10, "model": "gpt-6-luna" if "luna" in arms else None,
                 "seed": SEED, "search_version": 2}
     protocol = json.loads(encode(protocol))
