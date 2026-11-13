@@ -1,5 +1,5 @@
 param(
-    [string]$Run = 'runs/designer-comparison',
+    [string]$Run = 'runs/programmatic-search-comparison',
     [switch]$Once
 )
 

@@ -163,7 +163,7 @@ after two shared warm-up batches. Prepare single-asset 4h snapshots with
 python -m strategy_finder.designer_benchmark runs/designer-comparison --markets ETH SOL --batch 5000 --batches 20
 ```
 
-Double-click `Watch Learning Benchmark.bat` to monitor this run. Each arm
+Pass `-Run runs/designer-comparison` to the Windows monitor for this run. Each arm
 records its batch decisions, parameter frequencies, performance distributions,
 and distinct trade histories. Both arms on all markets freeze equally sized
 shortlists before the runner reads any holdout.
@@ -194,3 +194,9 @@ memory records component activity, paired effects, and whether those effects
 repeat across windows. Use `--programmatic-only --discovery-only` to exercise
 the search and freeze picks with the holdout sealed. Pass an earlier
 `development-memory.json` with `--memory` to reuse compatible evidence.
+
+Use `--compare-programmatic` to compare the legacy and revised programmatic
+designers with the same warm-up, rule catalogue, and primary shortlist
+ranking. The runner also evaluates a family-diverse shortlist for each arm.
+Double-click `Watch Learning Benchmark.bat` to follow
+`runs/programmatic-search-comparison`.

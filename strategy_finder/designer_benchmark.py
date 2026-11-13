@@ -10,7 +10,7 @@ import sqlite3
 import time
 from collections import Counter, OrderedDict
 from concurrent.futures import ProcessPoolExecutor
-from contextlib import closing
+from contextlib import ExitStack, closing
 from dataclasses import replace
 from pathlib import Path
 from statistics import median
@@ -541,17 +541,16 @@ def update_progress(directory, history, batch_size):
 def discover(root, market, config, protocol):
     setup = root/market
     budget, rounds = protocol["batch"], protocol["batches"]
-    directories = {arm: setup/arm for arm in ("shared", *ARMS)}
+    arms = protocol["arms"]
+    comparison = "legacy" in arms
+    directories = {arm: setup/arm for arm in ("shared", *arms)}
     for directory in directories.values():
         directory.mkdir(exist_ok=True)
-    arms = protocol["arms"]
     remembered = protocol["development_memory"].get(market, [])
     if all((directories[arm]/"endpoint.json").exists() for arm in arms):
         return
     status(root, "shared_warmup", market)
-    with (closing(open_db(directories["shared"]/"design.sqlite")) as shared,
-          closing(open_db(directories["programmatic"]/"design.sqlite")) as program_db,
-          closing(open_db(directories["luna"]/"design.sqlite")) as luna_db,
+    with (ExitStack() as stack, closing(open_db(directories["shared"]/"design.sqlite")) as shared,
           ProcessPoolExecutor(max_workers=protocol["workers"], initializer=setup_worker,
                               initargs=(setup, config, False)) as pool):
         warmup = [run_batch(shared, pool, 1, None, budget, 11, [], SEED)]
@@ -565,7 +564,7 @@ def discover(root, market, config, protocol):
         print(market, "shared warm-up complete", horizon, "forecast bars", flush=True)
         shared_records = prior(shared)
         histories = {a: [] for a in arms}
-        dbs = {a: {"programmatic": program_db, "luna": luna_db}[a] for a in arms}
+        dbs = {a: stack.enter_context(closing(open_db(directories[a]/"design.sqlite"))) for a in arms}
         status(root, "discovery", market)
         for batch in range(3, rounds+1):
             for arm in arms:
@@ -578,6 +577,8 @@ def discover(root, market, config, protocol):
                     context = campaign(history)
                     if arm == "programmatic":
                         decision = design_search.plan(context, history, design_menu(), budget, SEED+batch)
+                    elif arm == "legacy":
+                        decision = programmatic(context, batch, SEED+batch)
                     else:
                         decision, receipt = luna(root, config, batch, context, history,
                                                  shared_records+prior(db), protocol["max_api_usd"])
@@ -589,11 +590,17 @@ def discover(root, market, config, protocol):
                 update_progress(directories[arm], warmup+histories[arm], budget)
                 print(market, arm, batch, "complete", report["new_distinct"], "new histories",
                       report["new_10"], "new 10% qualifiers", flush=True)
-        frozen = {arm: freeze(shared_records+prior(db), protocol["shortlist"], diverse=True) for arm, db in dbs.items()}
-        common = min(len(picks) for picks in frozen.values())
+        frozen, diverse = {}, {}
+        for arm, db in dbs.items():
+            records = shared_records+prior(db)
+            frozen[arm] = freeze(records, protocol["shortlist"], diverse=not comparison)
+            if comparison:
+                diverse[arm] = freeze(records, protocol["shortlist"], diverse=True)
+        common = min(len(picks) for picks in (*frozen.values(), *diverse.values()))
         for arm in arms:
             write_json(directories[arm]/"endpoint.json", {
-                "picks": frozen[arm][:common], "backtests": rounds*budget, "completed_batches": rounds,
+                "picks": frozen[arm][:common], "diverse_picks": diverse.get(arm, [])[:common],
+                "backtests": rounds*budget, "completed_batches": rounds,
             })
         write_json(setup/"development-memory.json", {
             "assets": config["assets"], "frame": FRAME, "execution": config["execution"],
@@ -611,7 +618,7 @@ def evaluate_holdouts(root, protocol):
     arms = protocol["arms"]
     if not all((root/market/arm/"endpoint.json").is_file() for market in markets for arm in arms):
         raise ValueError("Freeze all shortlists before opening any holdout.")
-    rows, histories = [], {}
+    rows, diverse_rows, histories = [], [], {}
     for market in markets:
         setup = root/market
         config = read(setup/"config.json")
@@ -620,9 +627,13 @@ def evaluate_holdouts(root, protocol):
         for arm in arms:
             directory = setup/arm
             histories[f"{market}/{arm}"] = read(directory/"batch-history.json")
-            for pick in read(directory/"endpoint.json")["picks"]:
-                outcome = evaluate(pick["spec"], horizon)
-                rows.append({"market": market, "arm": arm, **pick, "holdout": outcome})
+            endpoint = read(directory/"endpoint.json")
+            evaluated = {}
+            for selection, destination in (("picks", rows), ("diverse_picks", diverse_rows)):
+                for pick in endpoint.get(selection, []):
+                    if pick["id"] not in evaluated:
+                        evaluated[pick["id"]] = evaluate(pick["spec"], horizon)
+                    destination.append({"market": market, "arm": arm, **pick, "holdout": evaluated[pick["id"]]})
     summary = ["# Strategy designer comparison", "",
                "Trial counts per arm include the same two shared warm-up batches. "
                "Holdout picks are frozen using development data before any holdout is loaded.",
@@ -642,13 +653,13 @@ def evaluate_holdouts(root, protocol):
                     "| Market | Batch | Backtests per arm | " + " | ".join(arms) + " |",
                     "|---|---:|---:|" + "---:|"*len(arms)])
     for market in markets:
-        for batch in sorted({b for b in (5, 10, 15, protocol["batches"]) if b <= protocol["batches"]}):
+        for batch in range(3, protocol["batches"]+1):
             counts = [sum(r["new_10"] for r in histories[f"{market}/{arm}"][2:batch]) for arm in arms]
             summary.append(f"| {market} | {batch} | {batch*protocol['batch']:,} | "
                            + " | ".join(f"{count:,}" for count in counts) + " |")
     summary.extend(["", "The detailed results contain every batch's parameter frequencies, performance quantiles, "
                     "new trade histories, matched warm-up comparisons, and frozen holdout picks."])
-    write_json(root/"results.json", {"batches": histories, "holdout": rows})
+    write_json(root/"results.json", {"batches": histories, "holdout": rows, "diverse_holdout": diverse_rows})
     (root/"summary.md").write_text("\n".join(summary)+"\n", encoding="utf-8")
     print("\n".join(summary), flush=True)
 
@@ -661,11 +672,15 @@ def main():
     cli.add_argument("--batches", type=int, default=20)
     cli.add_argument("--workers", type=int, default=8)
     cli.add_argument("--max-api-usd", type=float, default=12.)
-    cli.add_argument("--programmatic-only", action="store_true")
+    mode = cli.add_mutually_exclusive_group()
+    mode.add_argument("--programmatic-only", action="store_true")
+    mode.add_argument("--compare-programmatic", action="store_true")
     cli.add_argument("--discovery-only", action="store_true", help="Stop after freezing development picks.")
     cli.add_argument("--memory", type=Path, action="append", default=[],
                      help="Reuse a compatible development-memory.json from an earlier investigation.")
     args = cli.parse_args()
+    if args.compare_programmatic and args.memory:
+        cli.error("The programmatic comparison starts from the shared warm-up.")
     if args.batch < 50 or args.batch % 50 or args.batches < 3 or args.workers < 1 or args.max_api_usd <= 0:
         cli.error("Use a batch size divisible by 50, at least three batches, and positive worker and API limits.")
     root = args.root.resolve()
@@ -685,13 +700,16 @@ def main():
         if len(compatible) != 1 or compatible[0] in memory:
             raise ValueError(f"{path} must match one market and sizing setup, with earlier development data.")
         memory[compatible[0]] = saved["reports"]
+    arms = ("legacy", "programmatic") if args.compare_programmatic else (
+        ("programmatic",) if args.programmatic_only else ARMS)
     protocol = {"market_order": args.markets, "markets": configs, "development_memory": memory,
-                "arms": ("programmatic",) if args.programmatic_only else ARMS, "batch": args.batch,
+                "arms": arms, "batch": args.batch,
                 "families": list(DESIGN_FAMILIES),
                 "batches": args.batches, "workers": args.workers, "max_api_usd": args.max_api_usd,
-                "shortlist": 10, "model": "gpt-6-luna", "seed": SEED, "search_version": 2}
+                "shortlist": 10, "model": "gpt-6-luna" if "luna" in arms else None,
+                "seed": SEED, "search_version": 2}
     protocol = json.loads(encode(protocol))
-    if not args.programmatic_only:
+    if "luna" in arms:
         load_openai_settings(Path(".env"))
     with lock(root):
         path = root/"protocol.json"
@@ -699,10 +717,11 @@ def main():
             raise ValueError("The benchmark arguments differ from the frozen protocol.")
         write_json(path, protocol)
         try:
-            with closing(sqlite3.connect(root/"api-spending.sqlite")) as db, db:
-                db.execute("CREATE TABLE IF NOT EXISTS requests (id INTEGER PRIMARY KEY, microdollars INTEGER)")
-                db.execute("CREATE TABLE IF NOT EXISTS api_block (id INTEGER PRIMARY KEY, reason TEXT NOT NULL)")
-                db.execute("DELETE FROM api_block")
+            if "luna" in arms:
+                with closing(sqlite3.connect(root/"api-spending.sqlite")) as db, db:
+                    db.execute("CREATE TABLE IF NOT EXISTS requests (id INTEGER PRIMARY KEY, microdollars INTEGER)")
+                    db.execute("CREATE TABLE IF NOT EXISTS api_block (id INTEGER PRIMARY KEY, reason TEXT NOT NULL)")
+                    db.execute("DELETE FROM api_block")
             for market, config in configs.items():
                 discover(root, market, config, protocol)
             if args.discovery_only:
