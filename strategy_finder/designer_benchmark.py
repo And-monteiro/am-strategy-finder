@@ -7,6 +7,7 @@ import math
 import os
 import random
 import sqlite3
+import sys
 import time
 from collections import Counter, OrderedDict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -821,6 +822,7 @@ def main():
         if path.exists() and read(path) != protocol:
             raise ValueError("The benchmark arguments differ from the frozen protocol.")
         write_json(path, protocol)
+        write_json(root/"monitor-runtime.json", {"python": sys.executable})
         try:
             if "luna" in arms:
                 with closing(sqlite3.connect(root/"api-spending.sqlite")) as db, db:
