@@ -187,3 +187,10 @@ These definitions are inspired by
 [LuxAlgo's SMC indicator](https://www.luxalgo.com/library/indicator/smart-money-concepts-smc/).
 The SMC rules currently execute in Python. Reports mark their Pine export
 status as `python_only_smc`.
+
+The programmatic designer splits each adaptive batch between refinement,
+under-tested combinations, and matched component tests. Its development
+memory records component activity, paired effects, and whether those effects
+repeat across windows. Use `--programmatic-only --discovery-only` to exercise
+the search and freeze picks with the holdout sealed. Pass an earlier
+`development-memory.json` with `--memory` to reuse compatible evidence.

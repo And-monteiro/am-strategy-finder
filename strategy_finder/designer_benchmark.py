@@ -17,7 +17,7 @@ from statistics import median
 
 import numpy as np
 
-from . import planner
+from . import design_search, planner
 from .backtest import Execution, forecast_paths, simulate, time_machine
 from .cli import lock
 from .data import DAY, STEPS
@@ -193,6 +193,11 @@ def evaluate(spec, horizon):
     times, bars, start = WORKER["data"]
     execution = WORKER["execution"]
     signal = signals(times, bars, strategy, WORKER["features"])
+    active_signal = signal[start:]
+    blocked_signals = 0
+    if strategy.filter_rule:
+        ungated = signals(times, bars, replace(strategy, filter_rule=None), WORKER["features"])
+        blocked_signals = int(np.count_nonzero((ungated[start:] == 0) & (active_signal != 0)))
     forecast_bars = min(horizon, strategy.max_hold or horizon)
     forecasting = replace(strategy, forecast_bars=forecast_bars)
     admitted, scored = 0, 0
@@ -231,6 +236,8 @@ def evaluate(spec, horizon):
     cuts = np.searchsorted(active, np.linspace(active[0], active[-1]+STEP, 4))
     m["windows"] = [(float(equity[b]/equity[a]-1)) for a, b in zip(cuts, cuts[1:])]
     m["entry_forecasts"] = {"evaluated": scored, "accepted": admitted}
+    m["signal_activity"] = {"entry_bars": int(np.count_nonzero(active_signal == 0)),
+                            "confirmation_blocked": blocked_signals}
     m["exit_reasons"] = dict(Counter(t["reason"] for t in result["trades"]))
     return m
 
@@ -267,6 +274,8 @@ def batch_report(records, history):
         for name, value in spec["parameters"].items():
             params.setdefault(name, Counter())[value] += 1
     designs = {}
+    stable = Counter(encode(s["design"]) for s, m in fresh.values()
+                     if qualifies(m) and sum(v > 0 for v in m["windows"]) >= 2)
     for spec, m in records:
         designs.setdefault(encode(spec["design"]), []).append(m)
     return {
@@ -279,6 +288,7 @@ def batch_report(records, history):
                     for k in ("annual_net_return", "max_drawdown", "sharpe", "trades", "exposure")
                     if any(m[k] is not None for _, m in records)},
         "designs": [{"design": json.loads(k), "trials": len(ms),
+                     "stable_new": stable[k],
                      "qualifiers": sum(qualifies(m) for m in ms),
                      "median_return": median(m["annual_net_return"] for m in ms),
                      "median_drawdown": median(m["max_drawdown"] for m in ms),
@@ -293,6 +303,7 @@ def campaign(reports):
         for item in report["designs"]:
             totals.setdefault(encode(item["design"]), []).append(item)
     return [{"design": json.loads(key), "trials": sum(v["trials"] for v in vals),
+             "stable_new": sum(v.get("stable_new", 0) for v in vals),
              "qualifiers": sum(v["qualifiers"] for v in vals),
              "median_return": median(v["median_return"] for v in vals),
              "median_drawdown": median(v["median_drawdown"] for v in vals),
@@ -300,12 +311,16 @@ def campaign(reports):
             for key, vals in sorted(totals.items())]
 
 
-def programmatic(summary, batch, seed):
-    observed = {encode(x["design"]): x for x in summary}
-    menu = [design(f, policy, confirmation, gate, early)
+def design_menu():
+    return [design(f, policy, confirmation, gate, early)
             for f in DESIGN_FAMILIES for policy in ("signal", "bracket")
             for confirmation in ("none", *DESIGN_FAMILIES) for gate in (False, True)
             for early in (False, True) if not early or policy == "bracket"]
+
+
+def programmatic(summary, batch, seed):
+    observed = {encode(x["design"]): x for x in summary}
+    menu = design_menu()
     def utility(x):
         return (x["qualifiers"]/x["trials"], median(x["median_window_returns"]),
                 x["median_return"], -x["median_drawdown"])
@@ -384,6 +399,63 @@ def prior(db):
         "SELECT spec,metrics FROM trials WHERE metrics IS NOT NULL")]
 
 
+def refinement_parents(history, target):
+    ranked = sorted(((s, m) for s, m in history if s["design"]["family"] == target["family"] and m["trades"]),
+        key=lambda x: (x[0]["design"] == target, rank(x[1])), reverse=True)
+    parents = {}
+    for spec, m in ranked:
+        parents.setdefault(m["behavior"], spec["parameters"])
+        if len(parents) == 32:
+            break
+    return list(parents.values())
+
+
+def planned_candidates(decision, history, seen, seed):
+    rng = random.Random(seed)
+    records = []
+    for part in decision["allocations"]:
+        target, count = part["design"], part["trials"]
+        parents = refinement_parents(history, target) if part["sampling"] != "broad" else ()
+        cells = design_search.comparison_cells(target, part.get("components", ()))
+        remaining = count
+        for _ in range(count*100):
+            if not remaining:
+                break
+            source = sample(target, rng, parents)
+            group = [apply_tool(source, cell, rng) for cell in cells]
+            ids = [identity(s) for s in group]
+            if any(key in seen for key in ids):
+                continue
+            seen.update(ids)
+            records.extend(zip(ids, group))
+            remaining -= len(group)
+        if remaining:
+            raise ValueError(f"Insufficient fresh settings for {part}.")
+    return records
+
+
+def record_comparisons(records, decision):
+    offset = 0
+    comparisons = []
+    for part in decision["allocations"]:
+        selected = records[offset:offset+part["trials"]]
+        offset += part["trials"]
+        if part["sampling"] != "matched":
+            continue
+        cells = design_search.comparison_cells(part["design"], part["components"])
+        width = len(cells)
+        groups = [[m for _, m in selected[i:i+width]] for i in range(0, len(selected), width)]
+        activity = [{"trades": sum(g[i]["trades"] for g in groups),
+                     "confirmation_blocked": sum(g[i]["signal_activity"]["confirmation_blocked"] for g in groups),
+                     "signal_exits": sum(g[i]["exit_reasons"].get("signal", 0) for g in groups),
+                     "gate_evaluations": sum(g[i]["entry_forecasts"]["evaluated"] for g in groups),
+                     "gate_rejections": sum(g[i]["entry_forecasts"]["evaluated"]-g[i]["entry_forecasts"]["accepted"] for g in groups),
+                     "forecast_exits": sum(g[i]["exit_reasons"].get("forecast_exit", 0) for g in groups)}
+                    for i in range(width)]
+        comparisons.append(design_search.paired_evidence(cells, part["components"], groups, activity))
+    return comparisons
+
+
 def run_batch(db, pool, batch, decision, budget, horizon, initial, seed):
     row = db.execute("SELECT decision,report FROM batches WHERE n=?", (batch,)).fetchone()
     if row and row[1]:
@@ -394,11 +466,15 @@ def run_batch(db, pool, batch, decision, budget, horizon, initial, seed):
         seen = {i for i, in db.execute("SELECT id FROM trials")}
         seen.update(identity(s) for s, _ in initial)
         parents = ()
-        if decision:
-            target = decision["design"]
-            same_family = [(s,m) for s,m in history if s["design"]["family"] == target["family"]]
-            parents = [s["parameters"] for s,_ in sorted(same_family, key=lambda x: rank(x[1]), reverse=True)[:32]]
-        batch_candidates = candidates(batch, budget, seed, seen, decision, parents)
+        if decision and "allocations" in decision:
+            batch_candidates = planned_candidates(decision, history, seen, seed)
+        else:
+            if decision:
+                family = decision["design"]["family"]
+                same_family = [(s, m) for s, m in history if s["design"]["family"] == family]
+                parents = [s["parameters"] for s, _ in sorted(
+                    same_family, key=lambda item: rank(item[1]), reverse=True)[:32]]
+            batch_candidates = candidates(batch, budget, seed, seen, decision, parents)
         with db:
             db.execute("INSERT INTO batches VALUES (?,?,NULL)", (batch, encode(decision)))
             db.executemany("INSERT INTO trials VALUES (?,?,?,NULL)", [(i,batch,encode(s)) for i,s in batch_candidates])
@@ -414,6 +490,8 @@ def run_batch(db, pool, batch, decision, budget, horizon, initial, seed):
         "SELECT spec,metrics FROM trials WHERE batch=? ORDER BY rowid", (batch,))]
     result = batch_report(records, history)
     result.update(batch=batch, decision=decision)
+    if decision and "allocations" in decision:
+        result["comparisons"] = record_comparisons(records, decision)
     if batch == 2:
         pairs = list(zip(records[::2], records[1::2]))
         result["paired_tools"] = []
@@ -428,10 +506,20 @@ def run_batch(db, pool, batch, decision, budget, horizon, initial, seed):
     return result
 
 
-def freeze(records, count):
+def freeze(records, count, diverse=False):
     winners = []
     seen = set()
-    for spec, m in sorted(records, key=lambda x: rank(x[1]), reverse=True):
+    ranked = sorted(records, key=lambda x: rank(x[1]), reverse=True)
+    if diverse:
+        def spread(pool):
+            families = {}
+            for spec, m in pool:
+                families.setdefault(spec["design"]["family"], []).append((spec, m))
+            return [entries[i] for i in range(max(map(len, families.values()), default=0))
+                    for entries in families.values() if i < len(entries)]
+        ranked = (spread([(s, m) for s, m in ranked if qualifies(m) and m["trades"]])
+                  + spread([(s, m) for s, m in ranked if not qualifies(m) and m["trades"]]))
+    for spec, m in ranked:
         if m["behavior"] in seen or not m["trades"]:
             continue
         seen.add(m["behavior"])
@@ -456,7 +544,9 @@ def discover(root, market, config, protocol):
     directories = {arm: setup/arm for arm in ("shared", *ARMS)}
     for directory in directories.values():
         directory.mkdir(exist_ok=True)
-    if all((directories[arm]/"endpoint.json").exists() for arm in ARMS):
+    arms = protocol["arms"]
+    remembered = protocol["development_memory"].get(market, [])
+    if all((directories[arm]/"endpoint.json").exists() for arm in arms):
         return
     status(root, "shared_warmup", market)
     with (closing(open_db(directories["shared"]/"design.sqlite")) as shared,
@@ -474,20 +564,20 @@ def discover(root, market, config, protocol):
         write_json(directories["shared"]/"batch-history.json", warmup)
         print(market, "shared warm-up complete", horizon, "forecast bars", flush=True)
         shared_records = prior(shared)
-        histories = {a: [] for a in ARMS}
-        dbs = {"programmatic": program_db, "luna": luna_db}
+        histories = {a: [] for a in arms}
+        dbs = {a: {"programmatic": program_db, "luna": luna_db}[a] for a in arms}
         status(root, "discovery", market)
         for batch in range(3, rounds+1):
-            for arm in ARMS:
+            for arm in arms:
                 db = dbs[arm]
                 existing = db.execute("SELECT decision FROM batches WHERE n=?", (batch,)).fetchone()
                 if existing:
                     decision = json.loads(existing[0])
                 else:
-                    history = warmup+histories[arm]
+                    history = (remembered if arm == "programmatic" else [])+warmup+histories[arm]
                     context = campaign(history)
                     if arm == "programmatic":
-                        decision = programmatic(context, batch, SEED+batch)
+                        decision = design_search.plan(context, history, design_menu(), budget, SEED+batch)
                     else:
                         decision, receipt = luna(root, config, batch, context, history,
                                                  shared_records+prior(db), protocol["max_api_usd"])
@@ -499,12 +589,17 @@ def discover(root, market, config, protocol):
                 update_progress(directories[arm], warmup+histories[arm], budget)
                 print(market, arm, batch, "complete", report["new_distinct"], "new histories",
                       report["new_10"], "new 10% qualifiers", flush=True)
-        frozen = {arm: freeze(shared_records+prior(db), protocol["shortlist"]) for arm, db in dbs.items()}
+        frozen = {arm: freeze(shared_records+prior(db), protocol["shortlist"], diverse=True) for arm, db in dbs.items()}
         common = min(len(picks) for picks in frozen.values())
-        for arm in ARMS:
+        for arm in arms:
             write_json(directories[arm]/"endpoint.json", {
                 "picks": frozen[arm][:common], "backtests": rounds*budget, "completed_batches": rounds,
             })
+        write_json(setup/"development-memory.json", {
+            "assets": config["assets"], "frame": FRAME, "execution": config["execution"],
+            "split": config["split"], "development_hash": config["datasets"][FRAME]["development_hash"],
+            "reports": remembered+warmup+histories["programmatic"],
+        })
 
 
 def read(path):
@@ -513,15 +608,16 @@ def read(path):
 
 def evaluate_holdouts(root, protocol):
     markets = protocol["market_order"]
-    if not all((root/market/arm/"endpoint.json").is_file() for market in markets for arm in ARMS):
-        raise ValueError("Freeze both shortlists on every market before opening any holdout.")
+    arms = protocol["arms"]
+    if not all((root/market/arm/"endpoint.json").is_file() for market in markets for arm in arms):
+        raise ValueError("Freeze all shortlists before opening any holdout.")
     rows, histories = [], {}
     for market in markets:
         setup = root/market
         config = read(setup/"config.json")
         horizon = read(setup/"forecast-horizon.json")["bars"]
         setup_worker(setup, config, True)
-        for arm in ARMS:
+        for arm in arms:
             directory = setup/arm
             histories[f"{market}/{arm}"] = read(directory/"batch-history.json")
             for pick in read(directory/"endpoint.json")["picks"]:
@@ -534,7 +630,7 @@ def evaluate_holdouts(root, protocol):
                "Holdout 10% / picks | Holdout 15% / picks | Median holdout annualized net |",
                "|---|---|---:|---:|---:|---:|---:|"]
     for market in markets:
-        for arm in ARMS:
+        for arm in arms:
             results = [r["holdout"] for r in rows if r["market"] == market and r["arm"] == arm]
             reports = histories[f"{market}/{arm}"][2:]
             typical = f"{median(m['annual_net_return'] for m in results):.2%}" if results else "—"
@@ -543,12 +639,13 @@ def evaluate_holdouts(root, protocol):
                            f"{sum(qualifies(m) for m in results)}/{len(results)} | "
                            f"{sum(qualifies(m, .15) for m in results)}/{len(results)} | {typical} |")
     summary.extend(["", "## Distinct 10% qualifiers found after warm-up", "",
-                    "| Market | Batch | Backtests per arm | Programmatic | Luna |",
-                    "|---|---:|---:|---:|---:|"])
+                    "| Market | Batch | Backtests per arm | " + " | ".join(arms) + " |",
+                    "|---|---:|---:|" + "---:|"*len(arms)])
     for market in markets:
         for batch in sorted({b for b in (5, 10, 15, protocol["batches"]) if b <= protocol["batches"]}):
-            counts = [sum(r["new_10"] for r in histories[f"{market}/{arm}"][2:batch]) for arm in ARMS]
-            summary.append(f"| {market} | {batch} | {batch*protocol['batch']:,} | {counts[0]:,} | {counts[1]:,} |")
+            counts = [sum(r["new_10"] for r in histories[f"{market}/{arm}"][2:batch]) for arm in arms]
+            summary.append(f"| {market} | {batch} | {batch*protocol['batch']:,} | "
+                           + " | ".join(f"{count:,}" for count in counts) + " |")
     summary.extend(["", "The detailed results contain every batch's parameter frequencies, performance quantiles, "
                     "new trade histories, matched warm-up comparisons, and frozen holdout picks."])
     write_json(root/"results.json", {"batches": histories, "holdout": rows})
@@ -564,6 +661,10 @@ def main():
     cli.add_argument("--batches", type=int, default=20)
     cli.add_argument("--workers", type=int, default=8)
     cli.add_argument("--max-api-usd", type=float, default=12.)
+    cli.add_argument("--programmatic-only", action="store_true")
+    cli.add_argument("--discovery-only", action="store_true", help="Stop after freezing development picks.")
+    cli.add_argument("--memory", type=Path, action="append", default=[],
+                     help="Reuse a compatible development-memory.json from an earlier investigation.")
     args = cli.parse_args()
     if args.batch < 50 or args.batch % 50 or args.batches < 3 or args.workers < 1 or args.max_api_usd <= 0:
         cli.error("Use a batch size divisible by 50, at least three batches, and positive worker and API limits.")
@@ -574,12 +675,24 @@ def main():
                 or config["execution"]["capital"] != 1000 or config["execution"]["allocation"] != 1
                 or not config["execution"]["fixed_allocation"] or config["drawdown"] != .30):
             raise ValueError("Prepare single-asset 4h spot data with EUR 1,000, full allocation, and 30% drawdown cap.")
-    protocol = {"market_order": args.markets, "markets": configs, "arms": ARMS, "batch": args.batch,
+    memory = {}
+    for path in args.memory:
+        saved = read(path)
+        compatible = [market for market, cfg in configs.items()
+                      if saved["assets"] == cfg["assets"] and saved["execution"] == cfg["execution"]
+                      and saved["frame"] == FRAME and saved["split"] <= cfg["split"]
+                      and saved["development_hash"] != cfg["datasets"][FRAME]["development_hash"]]
+        if len(compatible) != 1 or compatible[0] in memory:
+            raise ValueError(f"{path} must match one market and sizing setup, with earlier development data.")
+        memory[compatible[0]] = saved["reports"]
+    protocol = {"market_order": args.markets, "markets": configs, "development_memory": memory,
+                "arms": ("programmatic",) if args.programmatic_only else ARMS, "batch": args.batch,
                 "families": list(DESIGN_FAMILIES),
                 "batches": args.batches, "workers": args.workers, "max_api_usd": args.max_api_usd,
-                "shortlist": 10, "model": "gpt-6-luna", "seed": SEED}
+                "shortlist": 10, "model": "gpt-6-luna", "seed": SEED, "search_version": 2}
     protocol = json.loads(encode(protocol))
-    load_openai_settings(Path(".env"))
+    if not args.programmatic_only:
+        load_openai_settings(Path(".env"))
     with lock(root):
         path = root/"protocol.json"
         if path.exists() and read(path) != protocol:
@@ -592,6 +705,9 @@ def main():
                 db.execute("DELETE FROM api_block")
             for market, config in configs.items():
                 discover(root, market, config, protocol)
+            if args.discovery_only:
+                status(root, "holdouts_ready")
+                return
             status(root, "evaluation")
             evaluate_holdouts(root, protocol)
             status(root, "complete", report="summary.md")

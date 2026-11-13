@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+from strategy_finder import design_search
 
 from strategy_finder.backtest import Execution, forecast_paths, metrics, simulate, time_machine
 from strategy_finder.data import DAY, HOUR, Candle, align, load_snapshot, save_snapshot
@@ -19,6 +20,19 @@ from strategy_finder.smc import structure
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_design_search_measures_component_interaction(self):
+        target = dict(family="breakout", policy="bracket", confirmation="choch",
+                      entry_gate=True, forecast_exit=False)
+        components = ["confirmation", "entry_gate"]
+        cells = design_search.comparison_cells(target, components)
+        self.assertEqual([(d["confirmation"], d["entry_gate"]) for d in cells],
+                         [("none", False), ("choch", False), ("none", True), ("choch", True)])
+        group = [dict(behavior=str(i), net_return=r, windows=[r]*3, max_drawdown=.1,
+                      trades=10, exposure=.2) for i, r in enumerate((0., .02, .03, .08))]
+        result = design_search.paired_evidence(cells, components, [group], [])
+        self.assertAlmostEqual(result["interaction_return_lift"], .03)
+        self.assertEqual(result["verdict"], "supported")
+
     def test_smc_structure_breaks_use_confirmed_pivots_and_prior_bias(self):
         prices = np.array([8, 9, 12, 10, 9, 8, 7, 8, 10, 13, 9, 8, 6], dtype=float)
         bars = np.repeat(prices[:, None], 5, axis=1)
